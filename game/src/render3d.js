@@ -20,11 +20,16 @@ import {
   vec3,
 } from './math.js';
 import {
+  PLANE_GLB_TRANSFORM,
   PLANE_NAV_LIGHTS,
+  PLANE_NAV_LIGHTS_PROCEDURAL,
   buildPlaneMesh,
   buildPropDiscMesh,
   buildPropellerMesh,
+  isPropPart,
 } from './aircraft.js';
+import { loadGlb } from './glb.js';
+import { buildGlbTreeMeshes, loadTreeGlbTemplates } from './treeGlb.js';
 import {
   COCKPIT_EYE,
   COCKPIT_LOOK_PITCH,
@@ -41,6 +46,7 @@ import {
   buildEmissiveMesh,
   buildFarmMaskCanvas,
   buildGroundTextureCanvas,
+  buildHeroFallbackMesh,
   buildLightDotMesh,
   buildMountainBandMesh,
   buildRingMesh,
@@ -56,6 +62,8 @@ import {
   buildWaterfallFoamMesh,
   buildWaterfallMesh,
   buildWaterfallMistMesh,
+  buildWaterfallRocksMesh,
+  getGlbTreePlacements,
   sampleMeshHeight,
   terrainHeight,
   waterLevelAt,
@@ -319,11 +327,14 @@ const SOLID_FS = `
   uniform sampler2D uRockTex;
   uniform sampler2D uSnowrockTex;
   uniform sampler2D uFarmMaskTex;
+  uniform sampler2D uGlbTex;
   uniform float uUseAlbedoTex;
   uniform float uUseDetailTex;
   uniform float uUsePhotoGround;
   uniform float uHasRockTex;
   uniform float uHasSnowrockTex;
+  uniform float uUseGlbTex;
+  uniform float uGlbAlphaCutoff;
   uniform float uIsTerrain;
   uniform float uTime;
   uniform float uIsDecal;
@@ -383,6 +394,7 @@ const SOLID_FS = `
     float roughness = 0.5;
     float matEmissive = 0.0;
     bool isCanopy = false;
+    float wetCliff = 0.0;
     if (uUseVertexMat > 0.5) {
       specStr = vMaterial.x;
       roughness = clamp(vMaterial.y, 0.02, 0.98);
@@ -412,6 +424,11 @@ const SOLID_FS = `
       albedo *= texSample.rgb;
       texAlpha = texSample.a;
       if (uIsDecal > 0.5 && texAlpha < 0.04) discard;
+    }
+    if (uUseGlbTex > 0.5) {
+      vec4 g = texture2D(uGlbTex, vUv);
+      albedo *= g.rgb;
+      if (uGlbAlphaCutoff >= 0.0 && g.a < uGlbAlphaCutoff) discard;
     }
     if (uIsTerrain > 0.5) {
       // Zone farmland patchwork strictly to flat lowland valley floor; blend smoothly to grass/earth detail on slopes & hills
@@ -512,6 +529,18 @@ const SOLID_FS = `
       float snowCover = snowLine * gentleSlope;
       vec3 snowCol = vec3(1.06, 1.04, 1.02) * clamp(vColor, vec3(0.86), vec3(1.06));
       albedo = mix(albedo, snowCol, snowCover * 0.92);
+
+      // Wet slick rock darkening & specular sheen on the waterfall headwall behind and between the 3 streams
+      float wfZMask = smoothstep(-1366.0, -1350.0, vWorldPos.z) * (1.0 - smoothstep(-1304.0, -1288.0, vWorldPos.z));
+      float wfXMask = 1.0 - smoothstep(46.0, 92.0, abs(vWorldPos.x - 200.0));
+      float wfYMask = 1.0 - smoothstep(-6.0, 6.0, vWorldPos.y);
+      wetCliff = wfZMask * wfXMask * wfYMask * (1.0 - smoothstep(0.55, 0.85, n.y));
+      if (wetCliff > 0.002) {
+        float wetStreak = vNoise2(vec2(vWorldPos.x * 0.18, vWorldPos.y * 0.035));
+        albedo *= mix(1.0, 0.36 + 0.14 * wetStreak, wetCliff);
+        specStr = mix(specStr, 0.58, wetCliff);
+        shininess = mix(shininess, 54.0, wetCliff);
+      }
     } else if (uUsePhotoGround > 0.5) {
       vec3 photoGround = pow(texture2D(uPhotoGroundTex, vWorldPos.xz / 680.0).rgb, vec3(1.12)) * 1.32;
       albedo *= photoGround;
@@ -754,9 +783,9 @@ const CLOUD_FS = `
     float puffNoise = n1 * 0.65 + n2 * 0.35;
 
     // Gentle wide Fresnel feathering and natural cloud/mist translucency (no opaque blob / cutoff)
-    float fresnelFade = pow(max(ndv, 1e-4), uIsMist > 0.5 ? 3.2 : 1.65);
+    float fresnelFade = pow(max(ndv, 1e-4), uIsMist > 0.5 ? 2.15 : 1.65);
     float baseAlpha = uIsMist > 0.5
-      ? clamp(fresnelFade * (0.08 + 0.14 * puffNoise), 0.0, 0.18)
+      ? clamp(fresnelFade * (0.06 + 0.16 * puffNoise), 0.0, 0.21)
       : clamp(fresnelFade * (0.56 + 0.50 * puffNoise) * 0.84, 0.0, 0.86);
     float alpha = baseAlpha * nearFade;
     if (uDepthOnly > 0.5) {
@@ -771,7 +800,7 @@ const CLOUD_FS = `
     vec3 midCol = vec3(0.99, 0.94, 0.90);
     vec3 crownCol = vec3(1.05, 1.01, 0.96);
     vec3 gradCol = uIsMist > 0.5
-      ? vec3(0.92, 0.88, 0.84)
+      ? vec3(0.85, 0.90, 0.94)
       : (topBias < 0.5
         ? mix(baseCol, midCol, topBias * 2.0)
         : mix(midCol, crownCol, (topBias - 0.5) * 2.0));
@@ -788,7 +817,7 @@ const CLOUD_FS = `
     float sunAmt = pow(max(dot(-v, l), 1e-4), 5.0);
     vec3 fogCol = mix(max(uFogColor, vec3(0.82, 0.64, 0.52)), uSunColor * 0.98, sunAmt * 0.45);
     vec3 finalCol = mix(col, fogCol, clamp(fog, 0.0, 1.0));
-    finalCol = max(finalCol, uIsMist > 0.5 ? vec3(0.84, 0.80, 0.76) : vec3(0.64, 0.62, 0.61));
+    finalCol = max(finalCol, uIsMist > 0.5 ? vec3(0.76, 0.80, 0.84) : vec3(0.64, 0.62, 0.61));
     gl_FragColor = vec4(gradeAndToneMap(finalCol), alpha);
   }
 `;
@@ -927,46 +956,79 @@ const WATERFALL_FS = `
     float alpha;
 
     if (uIsFoam > 0.5) {
-      float swirl = vNoise2(vWorldPos.xz * 0.14 + vec2(0.0, -uTime * 0.55)) * 0.28
-                  + vNoise2(vWorldPos.xz * 0.34 + vec2(uTime * 0.2, -uTime * 0.9)) * 0.14;
-      float rad = length(vUv) + (swirl - 0.21);
+      float swirl = vNoise2(vWorldPos.xz * 0.11 + vec2(0.0, -uTime * 0.52)) * 0.26
+                  + vNoise2(vWorldPos.xz * 0.29 + vec2(uTime * 0.22, -uTime * 0.95)) * 0.18;
+      float rad = length(vUv) + (swirl - 0.22);
       if (rad > 1.0) discard;
-      float ring = 0.58 + 0.42 * sin(rad * 16.0 - uTime * 3.4);
-      float edgeFade = pow(1.0 - smoothstep(0.16, 0.98, rad), 1.65);
-      float coreFoam = 1.0 - smoothstep(0.0, 0.52, rad);
-      vec3 texFoam = vec3(0.94, 0.96, 0.98);
+      float ring = 0.48 + 0.52 * sin(rad * 22.0 - uTime * 3.6);
+      float edgeFade = pow(1.0 - smoothstep(0.18, 0.98, rad), 1.45);
+      float impactRing = exp(-pow((rad - 0.28) * 4.2, 2.0)) * 0.36;
+      float lacy1 = vNoise2(vWorldPos.xz * 0.44 + vec2(0.0, -uTime * 1.05));
+      float lacy2 = vNoise2(vWorldPos.xz * 0.92 + vec2(3.1, -uTime * 1.45));
+      float lacy = smoothstep(0.32, 0.82, lacy1 * 0.62 + lacy2 * 0.38);
+      vec3 texFoam = vec3(0.76, 0.82, 0.86);
       if (uHasWaterfallTex > 0.5) {
-        vec2 fUv = vUv * 0.48 + vec2(0.5, 0.72 - uTime * 0.08);
+        vec2 fUv = vUv * 0.72 + vec2(0.5, 0.72 - uTime * 0.10);
         texFoam = texture2D(uWaterfallTex, fUv).rgb;
       }
       float luma = dot(texFoam, vec3(0.3, 0.59, 0.11));
-      col = mix(vec3(0.84, 0.90, 0.94), vec3(1.14, 1.09, 1.04), clamp(luma * 1.28 * ring + coreFoam * 0.25, 0.0, 1.0));
-      alpha = edgeFade * clamp(0.56 + 0.44 * luma * ring + coreFoam * 0.22, 0.0, 0.95);
+      float foamDens = clamp(impactRing + luma * ring * 0.48 + lacy * 0.50, 0.0, 0.96);
+      vec3 aeratedTeal = vec3(0.20, 0.43, 0.52);
+      vec3 frothMid = vec3(0.52, 0.71, 0.77);
+      vec3 foamCap = vec3(0.90, 0.93, 0.95) + uSunColor * 0.04;
+      col = mix(aeratedTeal, mix(frothMid, foamCap, smoothstep(0.32, 0.84, foamDens)), clamp(foamDens * 1.12, 0.0, 1.0));
+      alpha = edgeFade * clamp(0.22 + foamDens * 0.72, 0.0, 0.86);
     } else {
-      float sideFeather = smoothstep(0.0, 0.14, vUv.x) * (1.0 - smoothstep(0.86, 1.0, vUv.x));
-      float topFade = 0.28 + 0.72 * smoothstep(0.0, 0.16, vUv.y);
-      float botFade = 1.0 - smoothstep(1.54, 2.16, vUv.y);
-      vec2 uv1 = vec2(vUv.x * 1.35, vUv.y - uTime * 0.65);
-      vec2 uv2 = vec2(vUv.x * 2.05 + 0.37, vUv.y * 1.38 - uTime * 0.98);
-      vec3 s1 = vec3(0.82, 0.88, 0.94);
-      vec3 s2 = vec3(0.94, 0.96, 1.00);
+      float seed = vColor.g * 12.0;
+      float streamWeight = vColor.r;
+      float ledgeFoam = vColor.b;
+      // Asymmetric ragged edge breakup so left & right margins break into irregular water tongues
+      float leftNoise = (vNoise2(vec2(vUv.y * 4.2 + seed, vUv.x * 3.0 - uTime * 0.95)) - 0.5) * 0.36
+                      + (vNoise2(vec2(vUv.y * 11.0 - seed * 1.7, vUv.x * 7.2 - uTime * 1.85)) - 0.5) * 0.22;
+      float rightNoise = (vNoise2(vec2(vUv.y * 4.5 - seed * 2.1, vUv.x * 3.2 - uTime * 1.05)) - 0.5) * 0.36
+                       + (vNoise2(vec2(vUv.y * 11.8 + seed * 1.3, vUv.x * 7.6 - uTime * 1.95)) - 0.5) * 0.22;
+      float baseMargin = mix(0.11, 0.05, smoothstep(0.25, 1.9, vUv.y));
+      float leftMargin = max(0.02, baseMargin + leftNoise);
+      float rightMargin = max(0.02, baseMargin + rightNoise);
+      float leftMask = smoothstep(leftMargin, leftMargin + 0.09, vUv.x);
+      float rightMask = 1.0 - smoothstep(1.0 - rightMargin - 0.09, 1.0 - rightMargin, vUv.x);
+      float sideFeather = leftMask * rightMask;
+      // Smooth lake-outlet entry blend (vUv.y=0..0.42) and uneven plunge-pool fade
+      float topFade = smoothstep(0.02, 0.40, vUv.y);
+      float botJitter = 0.22 * sin(vUv.x * 7.0 + seed * 1.9);
+      float botFade = 1.0 - smoothstep(1.42 + botJitter, 2.16 + botJitter * 0.4, vUv.y);
+
+      // Elongated vertical water streaks (stretched V, dual-speed scrolling layers, bright/shadow filament contrast)
+      vec2 uv1 = vec2(vUv.x * 5.6 + seed * 0.23, vUv.y * 0.24 - uTime * 0.68);
+      vec2 uv2 = vec2(vUv.x * 10.4 + 0.37 - seed * 0.17, vUv.y * 0.38 - uTime * 1.34);
+      vec3 s1 = vec3(0.80, 0.88, 0.94);
+      vec3 s2 = vec3(0.94, 0.97, 1.00);
       if (uHasWaterfallTex > 0.5) {
         s1 = texture2D(uWaterfallTex, uv1).rgb;
         s2 = texture2D(uWaterfallTex, uv2).rgb;
-      } else {
-        float st1 = 0.5 + 0.5 * sin(uv1.x * 28.0 + sin(uv1.y * 9.0));
-        float st2 = 0.5 + 0.5 * sin(uv2.x * 42.0 - uv2.y * 11.0);
-        s1 *= (0.65 + 0.35 * st1);
-        s2 *= (0.65 + 0.35 * st2);
       }
-      vec3 blended = max(s1, s2 * 0.92) + s1 * s2 * 0.38;
-      float streak = clamp(dot(blended, vec3(0.28, 0.58, 0.14)), 0.0, 1.2);
-      vec3 wetRock = vec3(0.24, 0.27, 0.31) * vColor;
-      vec3 whiteWater = vec3(1.06, 1.00, 0.94) + uSunColor * 0.12;
-      col = mix(wetRock, whiteWater, smoothstep(0.20, 0.84, streak));
-      float baseSplash = smoothstep(1.45, 2.15, vUv.y);
-      col = mix(col, vec3(1.12, 1.06, 1.00), baseSplash * 0.45);
-      alpha = sideFeather * topFade * botFade * clamp(0.46 + streak * 0.56 + baseSplash * 0.24, 0.0, 0.96);
+      // Fine stretched falling filaments & alternating bright/shadow vertical channels
+      float fil1 = vNoise2(vec2(vUv.x * 22.0 + seed * 3.1, vUv.y * 0.62 - uTime * 2.1));
+      float fil2 = vNoise2(vec2(vUv.x * 42.0 - seed * 2.3, vUv.y * 0.95 - uTime * 3.4));
+      float channelRibs = vNoise2(vec2(vUv.x * 13.5 + seed * 1.7, vUv.y * 0.30 - uTime * 1.05));
+      vec3 blended = mix(s1, s2, 0.45) + s1 * s2 * 0.20;
+      float texStreak = dot(blended, vec3(0.28, 0.58, 0.14));
+      float streak = clamp(texStreak * 0.54 + fil1 * 0.38 + fil2 * 0.26 + ledgeFoam * 0.26 - (1.0 - channelRibs) * 0.22, 0.0, 1.35);
+
+      // Transition from turquoise lake current at lip into slate-blue shadowed water & bright aerated streaks
+      float aeration = smoothstep(0.10, 0.58, vUv.y);
+      vec3 lakeCurrent = vec3(0.20, 0.36, 0.42);
+      vec3 shadowStreak = vec3(0.26, 0.36, 0.44);
+      vec3 midSpray = vec3(0.56, 0.68, 0.75);
+      vec3 whiteWater = vec3(0.88, 0.91, 0.94) + uSunColor * 0.04;
+      vec3 fallCol = mix(shadowStreak, mix(midSpray, whiteWater, smoothstep(0.52, 0.98, streak)), smoothstep(0.22, 0.72, streak));
+      col = mix(lakeCurrent, fallCol, aeration);
+      float baseSplash = smoothstep(1.42, 2.14, vUv.y);
+      col = mix(col, vec3(0.86, 0.90, 0.93), max(baseSplash * 0.24, ledgeFoam * 0.22));
+
+      float breakMask = smoothstep(0.14, 0.68, streak + (1.0 - abs(vUv.x - 0.5) * 2.0) * 0.24);
+      alpha = sideFeather * topFade * botFade * streamWeight * clamp((0.36 + streak * 0.54 + baseSplash * 0.10) * breakMask, 0.0, 0.92);
+      if (alpha < 0.02) discard;
     }
 
     float fog = 1.0 - exp(-pow(max(dist * uFogDensity * 0.85, 1e-4), 1.65));
@@ -1323,6 +1385,64 @@ export function createRenderer3D(canvas, random) {
   const rockPhoto = loadPhotoTexture('./assets/tex-rock.jpg', makeSolidColorCanvas(164, 88, 60), gl.REPEAT, gl.REPEAT, 2048, 1024, true);
   const snowrockPhoto = loadPhotoTexture('./assets/tex-snowrock.jpg', makeSolidColorCanvas(150, 155, 164), gl.REPEAT, gl.REPEAT, 2048, 1024, true);
   const waterfallPhoto = loadPhotoTexture('./assets/tex-waterfall.jpg', makeSolidColorCanvas(215, 225, 235), gl.MIRRORED_REPEAT, gl.REPEAT, 2048, 1024);
+  let planeGpu = [{ gpu: uploadMesh(gl, buildPlaneMesh()), texture: null, alphaCutoff: -1 }];
+  let propGpu = [{ gpu: uploadMesh(gl, buildPropellerMesh()), texture: null, alphaCutoff: -1 }];
+  let planeIsGlb = false;
+  let planePropHubCenter = { x: 0, y: 0, z: -3.28 };
+
+  const planeGlbPromise = loadGlb(gl, './assets/models/plane.glb', {
+    transform: PLANE_GLB_TRANSFORM,
+    isPropPart,
+  })
+    .then((res) => {
+      if (!res.parts.length) throw new Error('plane.glb contained no airframe parts');
+      planeGpu = res.parts.map((part) => ({
+        gpu: uploadMesh(gl, part.mesh),
+        texture: part.texture,
+        alphaCutoff: part.alphaCutoff,
+      }));
+      if (res.propParts.length > 0) {
+        propGpu = res.propParts.map((part) => ({
+          gpu: uploadMesh(gl, part.mesh),
+          texture: part.texture,
+          alphaCutoff: part.alphaCutoff,
+        }));
+      }
+      planePropHubCenter = res.propHubCenter;
+      planeIsGlb = true;
+    })
+    .catch((err) => {
+      console.warn('plane.glb load failed, keeping procedural aircraft fallback:', err);
+    });
+
+  const treesGpu = uploadMesh(gl, buildTreesMesh(random));
+  const heroTreePlacements = getGlbTreePlacements();
+  const heroFallbackGpu = heroTreePlacements.length > 0
+    ? uploadMesh(gl, buildHeroFallbackMesh(heroTreePlacements))
+    : null;
+  let treeGlbParts = [];
+  let treesGlbReady = false;
+  let treesGlbFailed = false;
+
+  const treeGlbPromise = heroTreePlacements.length > 0
+    ? loadTreeGlbTemplates(gl)
+        .then((templates) => {
+          const baked = buildGlbTreeMeshes(templates, heroTreePlacements);
+          treeGlbParts = baked
+            .filter((part) => part.mesh.vertexCount > 0)
+            .map((part) => ({
+              gpu: uploadMesh(gl, part.mesh),
+              texture: part.texture,
+              alphaCutoff: part.alphaCutoff,
+            }));
+          treesGlbReady = true;
+        })
+        .catch((err) => {
+          console.warn('tree GLB load failed, using procedural hero fallback:', err);
+          treesGlbFailed = true;
+        })
+    : Promise.resolve();
+
   const ready = Promise.all([
     skyPhoto.promise,
     groundPhoto.promise,
@@ -1332,9 +1452,12 @@ export function createRenderer3D(canvas, random) {
     rockPhoto.promise,
     snowrockPhoto.promise,
     waterfallPhoto.promise,
+    planeGlbPromise,
+    treeGlbPromise,
   ]);
 
   const terrainGpu = uploadMesh(gl, buildTerrainMesh());
+  const waterfallRocksGpu = uploadMesh(gl, buildWaterfallRocksMesh());
   const waterGpu = uploadMesh(gl, buildWaterMesh(), true);
   const waterfallGpu = uploadMesh(gl, buildWaterfallMesh());
   const waterfallFoamGpu = uploadMesh(gl, buildWaterfallFoamMesh());
@@ -1346,9 +1469,6 @@ export function createRenderer3D(canvas, random) {
   const villageGpu = uploadMesh(gl, buildVillageMesh());
   const emissiveGpu = uploadMesh(gl, buildEmissiveMesh());
   const cloudsGpu = uploadMesh(gl, buildCloudsMesh(createRandom(77)));
-  const treesGpu = uploadMesh(gl, buildTreesMesh(random));
-  const planeGpu = uploadMesh(gl, buildPlaneMesh());
-  const propGpu = uploadMesh(gl, buildPropellerMesh());
   const propDiscGpu = uploadMesh(gl, buildPropDiscMesh());
   const cockpitCowlGpu = uploadMesh(gl, buildCockpitCowlMesh());
   const cockpitFrameGpu = uploadMesh(gl, buildCockpitFrameMesh());
@@ -1468,11 +1588,14 @@ export function createRenderer3D(canvas, random) {
     uRockTex: gl.getUniformLocation(solidProg, 'uRockTex'),
     uSnowrockTex: gl.getUniformLocation(solidProg, 'uSnowrockTex'),
     uFarmMaskTex: gl.getUniformLocation(solidProg, 'uFarmMaskTex'),
+    uGlbTex: gl.getUniformLocation(solidProg, 'uGlbTex'),
     uUseAlbedoTex: gl.getUniformLocation(solidProg, 'uUseAlbedoTex'),
     uUseDetailTex: gl.getUniformLocation(solidProg, 'uUseDetailTex'),
     uUsePhotoGround: gl.getUniformLocation(solidProg, 'uUsePhotoGround'),
     uHasRockTex: gl.getUniformLocation(solidProg, 'uHasRockTex'),
     uHasSnowrockTex: gl.getUniformLocation(solidProg, 'uHasSnowrockTex'),
+    uUseGlbTex: gl.getUniformLocation(solidProg, 'uUseGlbTex'),
+    uGlbAlphaCutoff: gl.getUniformLocation(solidProg, 'uGlbAlphaCutoff'),
     uIsTerrain: gl.getUniformLocation(solidProg, 'uIsTerrain'),
     uTime: gl.getUniformLocation(solidProg, 'uTime'),
     uIsDecal: gl.getUniformLocation(solidProg, 'uIsDecal'),
@@ -1958,9 +2081,16 @@ export function createRenderer3D(canvas, random) {
     propUpTmp.x = -p.right.x * sp + p.up.x * cp;
     propUpTmp.y = -p.right.y * sp + p.up.y * cp;
     propUpTmp.z = -p.right.z * sp + p.up.z * cp;
-    propPosTmp.x = p.pos.x + p.forward.x * 3.28;
-    propPosTmp.y = p.pos.y + p.forward.y * 3.28;
-    propPosTmp.z = p.pos.z + p.forward.z * 3.28;
+    if (planeIsGlb) {
+      // GLB hub center in aircraft local space (right, up, -forward); for plane.glb: (0, +0.30, -3.52)
+      propPosTmp.x = p.pos.x + p.right.x * planePropHubCenter.x + p.up.x * planePropHubCenter.y - p.forward.x * planePropHubCenter.z;
+      propPosTmp.y = p.pos.y + p.right.y * planePropHubCenter.x + p.up.y * planePropHubCenter.y - p.forward.y * planePropHubCenter.z;
+      propPosTmp.z = p.pos.z + p.right.z * planePropHubCenter.x + p.up.z * planePropHubCenter.y - p.forward.z * planePropHubCenter.z;
+    } else {
+      propPosTmp.x = p.pos.x + p.forward.x * 3.28;
+      propPosTmp.y = p.pos.y + p.forward.y * 3.28;
+      propPosTmp.z = p.pos.z + p.forward.z * 3.28;
+    }
     mat4FromBasis(propMat, propPosTmp, propRightTmp, propUpTmp, p.forward, 1.0);
 
     // 0. Real-time 2048 shadow map pass from the low warm sun
@@ -1994,13 +2124,29 @@ export function createRenderer3D(canvas, random) {
       bindPosOnly(treesGpu, shadowLoc.aPosition);
       gl.drawArrays(gl.TRIANGLES, 0, treesGpu.vertexCount);
 
+      if (treesGlbReady) {
+        gl.disable(gl.CULL_FACE);
+        for (let i = 0; i < treeGlbParts.length; i += 1) {
+          bindPosOnly(treeGlbParts[i].gpu, shadowLoc.aPosition);
+          gl.drawArrays(gl.TRIANGLES, 0, treeGlbParts[i].gpu.vertexCount);
+        }
+        gl.enable(gl.CULL_FACE);
+      } else if (treesGlbFailed && heroFallbackGpu) {
+        bindPosOnly(heroFallbackGpu, shadowLoc.aPosition);
+        gl.drawArrays(gl.TRIANGLES, 0, heroFallbackGpu.vertexCount);
+      }
+
       gl.uniformMatrix4fv(shadowLoc.uModel, false, modelMat);
-      bindPosOnly(planeGpu, shadowLoc.aPosition);
-      gl.drawArrays(gl.TRIANGLES, 0, planeGpu.vertexCount);
+      for (let i = 0; i < planeGpu.length; i += 1) {
+        bindPosOnly(planeGpu[i].gpu, shadowLoc.aPosition);
+        gl.drawArrays(gl.TRIANGLES, 0, planeGpu[i].gpu.vertexCount);
+      }
 
       gl.uniformMatrix4fv(shadowLoc.uModel, false, propMat);
-      bindPosOnly(propGpu, shadowLoc.aPosition);
-      gl.drawArrays(gl.TRIANGLES, 0, propGpu.vertexCount);
+      for (let i = 0; i < propGpu.length; i += 1) {
+        bindPosOnly(propGpu[i].gpu, shadowLoc.aPosition);
+        gl.drawArrays(gl.TRIANGLES, 0, propGpu[i].gpu.vertexCount);
+      }
 
       if (shadowLoc.aPosition >= 0) gl.disableVertexAttribArray(shadowLoc.aPosition);
       gl.disable(gl.POLYGON_OFFSET_FILL);
@@ -2090,6 +2236,11 @@ export function createRenderer3D(canvas, random) {
     gl.activeTexture(gl.TEXTURE6);
     gl.bindTexture(gl.TEXTURE_2D, farmMaskTex);
     gl.uniform1i(solidLoc.uFarmMaskTex, 6);
+    gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_2D, dummyWhiteTex);
+    gl.uniform1i(solidLoc.uGlbTex, 7);
+    gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+    gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
 
     gl.uniform1f(solidLoc.uShadowEnabled, shadowSupported ? 1.0 : 0.0);
     gl.uniform1f(solidLoc.uShadowTexel, 1.0 / SHADOW_SIZE);
@@ -2125,9 +2276,22 @@ export function createRenderer3D(canvas, random) {
     bindSolidMesh(terrainGpu, solidLoc);
     gl.drawArrays(gl.TRIANGLES, 0, terrainGpu.vertexCount);
 
-    // Textured Runway 36 (tex-runway.jpg asphalt + markings + micro-detail)
+    // Wet canyon rock ribs between & flanking the waterfall streams (glossy wet rock sheen)
     gl.uniform1f(solidLoc.uIsTerrain, 0.0);
     gl.uniform1f(solidLoc.uUsePhotoGround, 0.0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, rockPhoto.stateObj.tex);
+    gl.uniform1f(solidLoc.uEmissive, 0.0);
+    gl.uniform1f(solidLoc.uSpecStrength, 0.52);
+    gl.uniform1f(solidLoc.uShininess, 50.0);
+    gl.uniform1f(solidLoc.uUseAlbedoTex, rockPhoto.stateObj.loaded ? 1.0 : 0.0);
+    gl.uniform1f(solidLoc.uUseDetailTex, 1.0);
+    gl.uniform1f(solidLoc.uDetailScale, 0.11);
+    gl.uniform1f(solidLoc.uDetailStrength, 0.28);
+    bindSolidMesh(waterfallRocksGpu, solidLoc);
+    gl.drawArrays(gl.TRIANGLES, 0, waterfallRocksGpu.vertexCount);
+
+    // Textured Runway 36 (tex-runway.jpg asphalt + markings + micro-detail)
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, runwayPhoto.stateObj.tex);
     gl.uniform1f(solidLoc.uEmissive, 0.01);
@@ -2177,6 +2341,33 @@ export function createRenderer3D(canvas, random) {
     gl.uniform1f(solidLoc.uShininess, 14.0);
     bindSolidMesh(treesGpu, solidLoc);
     gl.drawArrays(gl.TRIANGLES, 0, treesGpu.vertexCount);
+    if (treesGlbReady) {
+      gl.disable(gl.CULL_FACE);
+      for (let i = 0; i < treeGlbParts.length; i += 1) {
+        const part = treeGlbParts[i];
+        if (part.texture) {
+          gl.activeTexture(gl.TEXTURE7);
+          gl.bindTexture(gl.TEXTURE_2D, part.texture);
+          gl.uniform1i(solidLoc.uGlbTex, 7);
+          gl.uniform1f(solidLoc.uUseGlbTex, 1.0);
+          gl.uniform1f(solidLoc.uGlbAlphaCutoff, part.alphaCutoff);
+        } else {
+          gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+          gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
+        }
+        bindSolidMesh(part.gpu, solidLoc);
+        gl.drawArrays(gl.TRIANGLES, 0, part.gpu.vertexCount);
+      }
+      gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+      gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
+      gl.activeTexture(gl.TEXTURE7);
+      gl.bindTexture(gl.TEXTURE_2D, dummyWhiteTex);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.enable(gl.CULL_FACE);
+    } else if (treesGlbFailed && heroFallbackGpu) {
+      bindSolidMesh(heroFallbackGpu, solidLoc);
+      gl.drawArrays(gl.TRIANGLES, 0, heroFallbackGpu.vertexCount);
+    }
     disableSolidMesh(solidLoc);
 
     // 2a. Unlit dusk emissive windows & main-street lights (depth-tested against buildings)
@@ -2340,18 +2531,41 @@ export function createRenderer3D(canvas, random) {
     gl.uniform1f(solidLoc.uSpecStrength, 0.48);
     gl.uniform1f(solidLoc.uShininess, 56.0);
     gl.uniform1f(solidLoc.uIsAircraft, 1.0);
+    function drawGlbParts(partsList) {
+      for (let i = 0; i < partsList.length; i += 1) {
+        const part = partsList[i];
+        if (part.texture) {
+          gl.activeTexture(gl.TEXTURE7);
+          gl.bindTexture(gl.TEXTURE_2D, part.texture);
+          gl.uniform1i(solidLoc.uGlbTex, 7);
+          gl.uniform1f(solidLoc.uUseGlbTex, 1.0);
+          gl.uniform1f(solidLoc.uGlbAlphaCutoff, part.alphaCutoff);
+        } else {
+          gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+          gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
+        }
+        bindSolidMesh(part.gpu, solidLoc);
+        gl.drawArrays(gl.TRIANGLES, 0, part.gpu.vertexCount);
+      }
+    }
+
     if (state.camMode === 2) {
+      gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+      gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
       bindSolidMesh(cockpitCowlGpu, solidLoc);
       gl.drawArrays(gl.TRIANGLES, 0, cockpitCowlGpu.vertexCount);
     } else {
-      bindSolidMesh(planeGpu, solidLoc);
-      gl.drawArrays(gl.TRIANGLES, 0, planeGpu.vertexCount);
+      drawGlbParts(planeGpu);
     }
 
     gl.uniformMatrix4fv(solidLoc.uModel, false, propMat);
     gl.uniform1f(solidLoc.uIsAircraft, 1.0);
-    bindSolidMesh(propGpu, solidLoc);
-    gl.drawArrays(gl.TRIANGLES, 0, propGpu.vertexCount);
+    drawGlbParts(propGpu);
+    gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+    gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
+    gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_2D, dummyWhiteTex);
+    gl.activeTexture(gl.TEXTURE0);
     gl.uniform1f(solidLoc.uUseVertexMat, 0.0);
     disableSolidMesh(solidLoc);
 
@@ -2493,6 +2707,8 @@ export function createRenderer3D(canvas, random) {
     gl.uniform1f(solidLoc.uUsePhotoGround, 0.0);
     gl.uniform1f(solidLoc.uHasRockTex, 0.0);
     gl.uniform1f(solidLoc.uHasSnowrockTex, 0.0);
+    gl.uniform1f(solidLoc.uUseGlbTex, 0.0);
+    gl.uniform1f(solidLoc.uGlbAlphaCutoff, -1.0);
     gl.uniform1f(solidLoc.uUseVertexMat, 1.0);
     gl.uniform1f(solidLoc.uIsAircraft, 0.0);
     gl.uniformMatrix4fv(solidLoc.uProjView, false, cockpitProjViewMat);
@@ -2529,7 +2745,7 @@ export function createRenderer3D(canvas, random) {
     propUpTmp.y = p.right.y * sy + p.up.y * cy;
     propUpTmp.z = p.right.z * sy + p.up.z * cy;
     const yzLocal = -1.56 - yokePitchPush;
-    const yokeMountY = 0.285 + clamp(yokeState.pitch, -1, 1) * 0.010;
+    const yokeMountY = 0.195 + clamp(yokeState.pitch, -1, 1) * 0.010;
     propPosTmp.x = p.pos.x + p.up.x * yokeMountY - p.forward.x * yzLocal;
     propPosTmp.y = p.pos.y + p.up.y * yokeMountY - p.forward.y * yzLocal;
     propPosTmp.z = p.pos.z + p.up.z * yokeMountY - p.forward.z * yzLocal;
@@ -2554,8 +2770,9 @@ export function createRenderer3D(canvas, random) {
     const flash2 = phase >= 0.16 && phase < 0.23 ? Math.sin(((phase - 0.16) / 0.07) * Math.PI) : 0;
     const strobe = 0.08 + 0.92 * Math.max(flash1, flash2);
 
-    for (let i = 0; i < PLANE_NAV_LIGHTS.length; i += 1) {
-      const nl = PLANE_NAV_LIGHTS[i];
+    const navLights = planeIsGlb ? PLANE_NAV_LIGHTS : PLANE_NAV_LIGHTS_PROCEDURAL;
+    for (let i = 0; i < navLights.length; i += 1) {
+      const nl = navLights[i];
       const wx = p.pos.x + p.right.x * nl.x + p.up.x * nl.y - p.forward.x * nl.z;
       const wy = p.pos.y + p.right.y * nl.x + p.up.y * nl.y - p.forward.y * nl.z;
       const wz = p.pos.z + p.right.z * nl.x + p.up.z * nl.y - p.forward.z * nl.z;

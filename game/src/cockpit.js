@@ -4,8 +4,8 @@
 import { MODE_FREE, MISSION_RINGS, PLANE } from './config.js';
 import { clamp, lerp } from './math.js';
 
-export const COCKPIT_EYE = { x: 0, y: 0.650, z: -0.90 };
-export const COCKPIT_LOOK_PITCH = -0.175;
+export const COCKPIT_EYE = { x: 0, y: 0.635, z: -0.84 };
+export const COCKPIT_LOOK_PITCH = -0.224;
 
 // Textured instrument face bounds in aircraft-local coordinates (2:1 aspect matching 2048x1024)
 const PANEL_Z = -1.72;
@@ -263,11 +263,11 @@ export function buildCockpitFrameMesh() {
   const b = createCockpitBuilder();
 
   // 1. Dark charcoal lower/outer instrument panel surround (covers wide FOV safely)
-  b.addBox(-0.88, -0.05, -1.78, 0.88, 0.468, PANEL_Z - 0.006, COL_PANEL, MAT_CHARCOAL);
+  b.addBox(-0.88, -0.14, -1.78, 0.88, 0.468, PANEL_Z - 0.006, COL_PANEL, MAT_CHARCOAL);
 
-  // Lower knee bolster apron & yoke mount housing
-  b.addBox(-0.72, -0.05, -1.75, 0.72, 0.125, -1.66, [0.085, 0.088, 0.10], MAT_LEATHER);
-  b.addBox(-0.075, 0.115, -1.74, 0.075, 0.295, -1.675, [0.09, 0.095, 0.11], MAT_TRIM);
+  // Lower knee bolster apron & yoke mount housing (tucked below 6-pack gauges)
+  b.addBox(-0.72, -0.14, -1.75, 0.72, 0.125, -1.66, [0.085, 0.088, 0.10], MAT_LEATHER);
+  b.addBox(-0.072, 0.06, -1.74, 0.072, 0.205, -1.675, [0.09, 0.095, 0.11], MAT_TRIM);
 
   // Side bolsters & lower kick panels
   b.addBox(-0.88, -0.05, -1.76, -0.68, 0.50, -0.82, [0.13, 0.13, 0.145], MAT_TRIM);
@@ -321,25 +321,25 @@ export function buildCockpitFaceMesh() {
   return b.toMesh();
 }
 
-/** Build the twin-grip Cessna-style control yoke centered around origin (mounted clearly visible in front of panel). */
+/** Build the twin-grip Cessna-style control yoke centered around origin (mounted clearly visible in lower-center). */
 export function buildYokeMesh() {
   const b = createCockpitBuilder();
   // Polished stainless steering column shaft + ribbed rubber boot collar extending into panel
-  b.addTube([0, 0, 0.012], [0, -0.016, -0.34], 0.020, 0.020, 14, [0.68, 0.70, 0.74], MAT_METAL);
-  b.addTube([0, -0.005, -0.08], [0, -0.011, -0.20], 0.027, 0.027, 12, [0.10, 0.10, 0.12], MAT_YOKE);
+  b.addTube([0, 0, 0.012], [0, -0.012, -0.34], 0.019, 0.019, 14, [0.68, 0.70, 0.74], MAT_METAL);
+  b.addTube([0, -0.004, -0.08], [0, -0.009, -0.20], 0.025, 0.025, 12, [0.10, 0.10, 0.12], MAT_YOKE);
   // Center hub housing + satin-silver bezel & warm gold wing crest emblem
-  b.addBox(-0.048, -0.032, -0.016, 0.048, 0.032, 0.032, [0.105, 0.11, 0.128], MAT_YOKE);
-  b.addBox(-0.034, -0.019, 0.032, 0.034, 0.020, 0.036, [0.46, 0.48, 0.53], MAT_METAL);
-  b.addBox(-0.024, -0.010, 0.036, 0.024, 0.011, 0.039, [0.86, 0.68, 0.24], MAT_METAL);
+  b.addBox(-0.044, -0.027, -0.016, 0.044, 0.027, 0.030, [0.105, 0.11, 0.128], MAT_YOKE);
+  b.addBox(-0.032, -0.017, 0.030, 0.032, 0.017, 0.034, [0.46, 0.48, 0.53], MAT_METAL);
+  b.addBox(-0.022, -0.009, 0.034, 0.022, 0.009, 0.037, [0.86, 0.68, 0.24], MAT_METAL);
 
   // Sculpted twin-grip wheel: sweeping lower arms + brushed spoke accents + contoured grips & metallic caps
   const gripCol = [0.12, 0.125, 0.145];
   for (const side of [-1, 1]) {
-    b.addTube([side * 0.038, -0.014, 0.008], [side * 0.128, -0.018, 0.012], 0.015, 0.015, 10, gripCol, MAT_YOKE);
-    b.addTube([side * 0.046, -0.012, 0.022], [side * 0.108, -0.016, 0.024], 0.006, 0.006, 8, [0.52, 0.54, 0.59], MAT_METAL);
-    b.addTube([side * 0.128, -0.018, 0.012], [side * 0.146, 0.028, 0.018], 0.016, 0.016, 10, gripCol, MAT_YOKE);
-    b.addTube([side * 0.146, 0.028, 0.018], [side * 0.136, 0.068, 0.015], 0.015, 0.015, 10, gripCol, MAT_YOKE);
-    b.addBox(side * 0.136 - 0.011, 0.064, 0.004, side * 0.136 + 0.011, 0.075, 0.025, [0.44, 0.46, 0.51], MAT_METAL);
+    b.addTube([side * 0.035, -0.012, 0.008], [side * 0.110, -0.016, 0.012], 0.0135, 0.0135, 10, gripCol, MAT_YOKE);
+    b.addTube([side * 0.042, -0.010, 0.020], [side * 0.095, -0.014, 0.022], 0.0055, 0.0055, 8, [0.52, 0.54, 0.59], MAT_METAL);
+    b.addTube([side * 0.110, -0.016, 0.012], [side * 0.126, 0.018, 0.017], 0.0145, 0.0145, 10, gripCol, MAT_YOKE);
+    b.addTube([side * 0.126, 0.018, 0.017], [side * 0.118, 0.050, 0.014], 0.0135, 0.0135, 10, gripCol, MAT_YOKE);
+    b.addBox(side * 0.118 - 0.010, 0.046, 0.004, side * 0.118 + 0.010, 0.056, 0.024, [0.44, 0.46, 0.51], MAT_METAL);
   }
   return b.toMesh();
 }
