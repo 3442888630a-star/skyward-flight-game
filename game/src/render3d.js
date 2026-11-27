@@ -3,6 +3,7 @@
 // water, drifting clouds, glowing target rings, ACES tone mapping & grading, and chase camera.
 
 import { MISSION_RINGS, MODE_MISSION, PALETTE, PLANE, RUNWAY, WORLD } from './config.js';
+import { createRandom } from './random.js';
 import {
   clamp,
   cross3,
@@ -38,6 +39,7 @@ import {
   buildCloudsMesh,
   buildDetailTextureCanvas,
   buildEmissiveMesh,
+  buildFarmMaskCanvas,
   buildGroundTextureCanvas,
   buildLightDotMesh,
   buildMountainBandMesh,
@@ -62,10 +64,10 @@ import {
 const SHADOW_SIZE = 2048;
 const SHADOW_HALF = 185;
 const SHADOW_TEXEL = (SHADOW_HALF * 2) / SHADOW_SIZE;
-const AMBIENT_SKY_MAUVE = new Float32Array([0.34, 0.30, 0.43]);
-const AMBIENT_GROUND_WARM = new Float32Array([0.23, 0.17, 0.12]);
-const WARM_HORIZON = new Float32Array([0.96, 0.56, 0.29]);
-const WARM_FOG = new Float32Array([0.95, 0.57, 0.31]);
+const AMBIENT_SKY_MAUVE = new Float32Array([0.33, 0.40, 0.50]);
+const AMBIENT_GROUND_WARM = new Float32Array([0.26, 0.21, 0.16]);
+const WARM_HORIZON = new Float32Array([0.96, 0.58, 0.33]);
+const WARM_FOG = new Float32Array([0.94, 0.62, 0.39]);
 
 const TONEMAP_GLSL = `
   vec3 acesFilm(vec3 x) {
@@ -82,7 +84,8 @@ const TONEMAP_GLSL = `
     vec3 sCurve = mapped * mapped * (3.0 - 2.0 * mapped);
     mapped = mix(mapped, sCurve, 0.14);
     float luma = dot(mapped, vec3(0.2126, 0.7152, 0.0722));
-    return clamp(mix(vec3(luma), mapped, 1.13), 0.0, 1.0);
+    float satBoost = mix(1.13, 1.01, smoothstep(0.50, 0.88, luma));
+    return clamp(mix(vec3(luma), mapped, satBoost), 0.0, 1.0);
   }
 
   float hash21(vec2 p) {
@@ -315,6 +318,7 @@ const SOLID_FS = `
   uniform sampler2D uPhotoGroundTex;
   uniform sampler2D uRockTex;
   uniform sampler2D uSnowrockTex;
+  uniform sampler2D uFarmMaskTex;
   uniform float uUseAlbedoTex;
   uniform float uUseDetailTex;
   uniform float uUsePhotoGround;
@@ -361,9 +365,13 @@ const SOLID_FS = `
     vec3 v = normalize(uCamPos - vWorldPos);
     float ndl = max(dot(n, l), 0.0);
 
-    // Hemisphere ambient: twilight sky fill above, warm ground bounce below
+    // Hemisphere ambient: cool twilight sky fill above (brighter pale-cool at altitude), warm ground bounce below
     float hemi = n.y * 0.5 + 0.5;
     vec3 amb = mix(uAmbientGround, uAmbientSky, hemi);
+    if (uIsTerrain > 0.5) {
+      float altAmb = smoothstep(220.0, 740.0, vWorldPos.y);
+      amb = mix(amb, vec3(0.44, 0.49, 0.58), altAmb * hemi * 0.55);
+    }
 
     // Soft 3x3 tent-weighted PCF shadow attenuation on direct sun contribution
     float shadow = sampleShadow(vLightPos, ndl);
@@ -406,48 +414,103 @@ const SOLID_FS = `
       if (uIsDecal > 0.5 && texAlpha < 0.04) discard;
     }
     if (uIsTerrain > 0.5) {
-      if (uUsePhotoGround > 0.5) {
+      // Zone farmland patchwork strictly to flat lowland valley floor; blend smoothly to grass/earth detail on slopes & hills
+      float farmZone = smoothstep(0.22, 0.78, texture2D(uFarmMaskTex, vUv).r);
+      float gentleFlat = smoothstep(0.925, 0.985, n.y);
+      float lowPlain = 1.0 - smoothstep(38.0, 68.0, vWorldPos.y);
+      float farmMask = farmZone * gentleFlat * lowPlain;
+
+      float gN1 = texture2D(uDetailTex, vWorldPos.xz * 0.0042 + vec2(0.17, 0.63)).r;
+      float gN2 = texture2D(uDetailTex, vec2(vWorldPos.x * 0.8 + vWorldPos.z * 0.6, vWorldPos.z * 0.8 - vWorldPos.x * 0.6) * 0.013).r;
+      float gMacro = vNoise2(vWorldPos.xz * 0.0075);
+      float gGrain = gN1 * 0.50 + gN2 * 0.30 + gMacro * 0.20;
+      float dryElev = smoothstep(42.0, 195.0, vWorldPos.y);
+      float drySlope = 1.0 - smoothstep(0.75, 0.94, n.y);
+      float dryT = clamp(max(dryElev, drySlope * 0.72), 0.0, 1.0);
+      vec3 grassTint = mix(vec3(0.84, 1.02, 0.72), vec3(0.98, 0.86, 0.68), dryT);
+      vec3 naturalGround = grassTint * (0.86 + gGrain * 0.30);
+
+      vec3 groundMult = naturalGround;
+      if (uUsePhotoGround > 0.5 && farmMask > 0.001) {
         vec3 photoGround = pow(max(texture2D(uPhotoGroundTex, vWorldPos.xz / 680.0).rgb, vec3(1e-4)), vec3(1.12)) * 1.32;
-        albedo *= photoGround;
+        groundMult = mix(naturalGround, photoGround, farmMask);
       }
+      albedo *= groundMult;
 
-      // Slope-aware triplanar-style UV projection so cliff strata stay horizontal on vertical walls
-      float sideBlend = smoothstep(0.20, 0.80, abs(n.x) / max(abs(n.x) + abs(n.z), 1e-4));
-      float steep = 1.0 - smoothstep(0.62, 0.86, n.y);
+      // Full 3-axis triplanar projection with consistent world texel density + dual-scale anti-tiling
+      vec3 an = abs(n);
+      vec3 triW = pow(vec3(an.x, an.y * 0.74, an.z), vec3(4.0));
+      triW /= max(triW.x + triW.y + triW.z, 1e-4);
+      float steep = 1.0 - smoothstep(0.60, 0.86, n.y);
 
-      // Sedimentary red-brown canyon walls & lower cliffs (tex-rock.jpg)
-      vec3 rockSample = vec3(0.64, 0.34, 0.23);
-      if (uHasRockTex > 0.5) {
-        vec2 rUvX = vec2(vWorldPos.z / 150.0, -vWorldPos.y / 84.0);
-        vec2 rUvZ = vec2(vWorldPos.x / 150.0, -vWorldPos.y / 84.0);
-        vec3 rTex = mix(texture2D(uRockTex, rUvZ).rgb, texture2D(uRockTex, rUvX).rgb, sideBlend);
-        rockSample = pow(max(rTex, vec3(1e-4)), vec3(1.10)) * 1.18;
-      }
-      float canyonBand = 1.0 - smoothstep(42.0, 145.0, vWorldPos.y);
+      // Sedimentary red-brown canyon walls, East High Sandstone Plateau & Eagle Gorge cliffs (tex-rock.jpg)
+      float isEastMesa = smoothstep(1150.0, 1650.0, vWorldPos.x) * smoothstep(-1250.0, -750.0, vWorldPos.z);
+      float canyonBand = max(1.0 - smoothstep(45.0, 155.0, vWorldPos.y), isEastMesa * (1.0 - smoothstep(275.0, 340.0, vWorldPos.y)));
       float canyonDepthBoost = 1.0 - smoothstep(-115.0, 28.0, vWorldPos.y);
       float canyonRockMask = clamp(steep * canyonBand + canyonDepthBoost * (1.0 - smoothstep(0.75, 0.94, n.y)) * 0.72, 0.0, 1.0);
-      albedo = mix(albedo, rockSample * vColor, canyonRockMask * 0.92);
-
-      // Alpine grey rock & snow ledges (tex-snowrock.jpg) on high AND steep terrain
-      vec3 snowRockSample = vec3(0.58, 0.60, 0.64);
-      if (uHasSnowrockTex > 0.5) {
-        vec2 sUvX = vec2(vWorldPos.z / 290.0, -vWorldPos.y / 165.0);
-        vec2 sUvZ = vec2(vWorldPos.x / 290.0, -vWorldPos.y / 165.0);
-        vec3 sTex = mix(texture2D(uSnowrockTex, sUvZ).rgb, texture2D(uSnowrockTex, sUvX).rgb, sideBlend);
-        snowRockSample = pow(max(sTex, vec3(1e-4)), vec3(1.08)) * 1.16;
+      if (canyonRockMask > 0.002) {
+        vec3 rockSample = vec3(0.64, 0.34, 0.23);
+        if (uHasRockTex > 0.5) {
+          vec3 rTex1 = vec3(0.0);
+          vec3 rTex2 = vec3(0.0);
+          if (triW.x > 0.02) {
+            rTex1 += texture2D(uRockTex, vec2(vWorldPos.z / 128.0, -vWorldPos.y / 64.0)).rgb * triW.x;
+            rTex2 += texture2D(uRockTex, vec2(-vWorldPos.z / 208.0 + 0.37, (-vWorldPos.y + vWorldPos.z * 0.14) / 104.0 + 0.53)).rgb * triW.x;
+          }
+          if (triW.y > 0.02) {
+            rTex1 += texture2D(uRockTex, vec2(vWorldPos.x / 128.0, vWorldPos.z / 64.0)).rgb * triW.y;
+            rTex2 += texture2D(uRockTex, vec2(vWorldPos.z / 208.0 + 0.43, -vWorldPos.x / 104.0 + 0.19)).rgb * triW.y;
+          }
+          if (triW.z > 0.02) {
+            rTex1 += texture2D(uRockTex, vec2(vWorldPos.x / 128.0, -vWorldPos.y / 64.0)).rgb * triW.z;
+            rTex2 += texture2D(uRockTex, vec2(-vWorldPos.x / 208.0 + 0.61, (-vWorldPos.y + vWorldPos.x * 0.14) / 104.0 + 0.29)).rgb * triW.z;
+          }
+          float rockMacroN = vNoise2(vWorldPos.xz / 150.0 + vec2(vWorldPos.y / 140.0, 3.7));
+          float rockHueN = vNoise2(vWorldPos.xz / 170.0 + vec2(9.2, -vWorldPos.y / 160.0));
+          vec3 rMixed = mix(rTex1, rTex2, 0.48);
+          rockSample = pow(max(rMixed, vec3(1e-4)), vec3(1.10)) * 1.18;
+          rockSample *= vec3(0.88 + rockMacroN * 0.24, 0.87 + rockHueN * 0.24, 0.88 + (1.0 - rockHueN) * 0.20);
+        }
+        albedo = mix(albedo, rockSample * vColor, canyonRockMask * 0.92);
       }
-      float highAlt = smoothstep(165.0, 265.0, vWorldPos.y);
-      float highSteep = 1.0 - smoothstep(0.58, 0.85, n.y);
-      float snowRockMask = clamp(highAlt * highSteep + smoothstep(235.0, 330.0, vWorldPos.y) * (1.0 - smoothstep(0.78, 0.92, n.y)) * 0.75, 0.0, 1.0);
-      albedo = mix(albedo, snowRockSample * vColor, snowRockMask * 0.94);
 
-      // Bright warm-white sun-tinted snow cover on gentle slopes above undulating snowline
+      // Alpine grey rock & snow ledges (tex-snowrock.jpg) on high AND steep alpine ranges (suppressed on lower sandstone mesa)
+      float highAlt = smoothstep(130.0, 235.0, vWorldPos.y);
+      float highSteep = 1.0 - smoothstep(0.58, 0.85, n.y);
+      float mesaRockMask = 1.0 - isEastMesa * (1.0 - smoothstep(295.0, 360.0, vWorldPos.y));
+      float snowRockMask = mesaRockMask * clamp(highAlt * highSteep + smoothstep(225.0, 320.0, vWorldPos.y) * (1.0 - smoothstep(0.78, 0.92, n.y)) * 0.75, 0.0, 1.0);
+      if (snowRockMask > 0.002) {
+        vec3 snowRockSample = vec3(0.58, 0.60, 0.64);
+        if (uHasSnowrockTex > 0.5) {
+          vec3 sTex1 = vec3(0.0);
+          vec3 sTex2 = vec3(0.0);
+          if (triW.x > 0.02) {
+            sTex1 += texture2D(uSnowrockTex, vec2(vWorldPos.z / 240.0, -vWorldPos.y / 120.0)).rgb * triW.x;
+            sTex2 += texture2D(uSnowrockTex, vec2(-vWorldPos.z / 390.0 + 0.41, (-vWorldPos.y + vWorldPos.z * 0.12) / 195.0 + 0.27)).rgb * triW.x;
+          }
+          if (triW.y > 0.02) {
+            sTex1 += texture2D(uSnowrockTex, vec2(vWorldPos.x / 240.0, vWorldPos.z / 120.0)).rgb * triW.y;
+            sTex2 += texture2D(uSnowrockTex, vec2(vWorldPos.z / 390.0 + 0.53, -vWorldPos.x / 195.0 + 0.31)).rgb * triW.y;
+          }
+          if (triW.z > 0.02) {
+            sTex1 += texture2D(uSnowrockTex, vec2(vWorldPos.x / 240.0, -vWorldPos.y / 120.0)).rgb * triW.z;
+            sTex2 += texture2D(uSnowrockTex, vec2(-vWorldPos.x / 390.0 + 0.19, (-vWorldPos.y + vWorldPos.x * 0.12) / 195.0 + 0.63)).rgb * triW.z;
+          }
+          float sMacroN = vNoise2(vWorldPos.xz / 160.0 + vec2(4.1, vWorldPos.y / 150.0));
+          vec3 sMixed = mix(sTex1, sTex2, 0.48);
+          snowRockSample = pow(max(sMixed, vec3(1e-4)), vec3(1.08)) * 1.12;
+          snowRockSample *= (0.87 + sMacroN * 0.26);
+        }
+        albedo = mix(albedo, snowRockSample * vColor, snowRockMask * 0.94);
+      }
+
+      // Clean bright snow cover on gentle alpine slopes above undulating snowline (suppressed on lower sandstone mesa)
       float snowWave = sin(vWorldPos.x * 0.0027) * cos(vWorldPos.z * 0.0023) * 28.0
         + sin((vWorldPos.x - vWorldPos.z) * 0.0059) * 14.0;
-      float snowLine = smoothstep(260.0 + snowWave, 365.0 + snowWave, vWorldPos.y);
-      float gentleSlope = smoothstep(0.56, 0.82, n.y);
+      float snowLine = smoothstep(285.0 + snowWave, 385.0 + snowWave, vWorldPos.y) * mesaRockMask;
+      float gentleSlope = smoothstep(0.58, 0.84, n.y);
       float snowCover = snowLine * gentleSlope;
-      vec3 snowCol = vec3(0.98, 0.96, 0.93) * clamp(vColor, vec3(0.82), vec3(1.06));
+      vec3 snowCol = vec3(1.06, 1.04, 1.02) * clamp(vColor, vec3(0.86), vec3(1.06));
       albedo = mix(albedo, snowCol, snowCover * 0.92);
     } else if (uUsePhotoGround > 0.5) {
       vec3 photoGround = pow(texture2D(uPhotoGroundTex, vWorldPos.xz / 680.0).rgb, vec3(1.12)) * 1.32;
@@ -488,12 +551,15 @@ const SOLID_FS = `
     float rim = fresnel * max(dot(-v, l) * 0.5 + 0.5, 0.0);
     lit += uSunColor * rim * (0.15 * sunVis);
 
-    float heightHaze = mix(0.80, 1.12, exp(-max(vWorldPos.y, 0.0) * 0.0022));
+    float altFogT = smoothstep(180.0, 760.0, max(vWorldPos.y, uCamPos.y * 0.55));
+    vec3 highFogCol = vec3(0.88, 0.84, 0.79);
+    vec3 baseFog = mix(uFogColor, highFogCol, altFogT * 0.62);
+    float heightHaze = mix(0.60, 1.12, exp(-max(vWorldPos.y, 0.0) * 0.0024));
     float fog = 1.0 - exp(-pow(dist * uFogDensity * heightHaze, 1.65));
     // Warm sun-scatter tint in fog looking toward sun
     vec3 viewDir = normalize(vWorldPos - uCamPos);
     float sunAmt = pow(max(dot(viewDir, l), 0.0), 5.0);
-    vec3 fogCol = mix(uFogColor, uSunColor * 0.96, sunAmt * 0.48);
+    vec3 fogCol = mix(baseFog, uSunColor * 0.98, sunAmt * mix(0.48, 0.32, altFogT));
     vec3 finalCol = mix(lit, fogCol, clamp(fog, 0.0, 1.0));
     gl_FragColor = vec4(gradeAndToneMap(finalCol), uIsDecal > 0.5 ? texAlpha : 1.0);
   }
@@ -505,9 +571,11 @@ const WATER_VS = `
   uniform mat4 uProjView;
   varying vec3 vWorldPos;
   varying float vDepth;
+  varying vec2 vFlow;
   void main() {
     vWorldPos = aPosition;
     vDepth = aColor.r;
+    vFlow = (aColor.gb - 0.5) * 2.0;
     gl_Position = uProjView * vec4(aPosition, 1.0);
   }
 `;
@@ -516,6 +584,7 @@ const WATER_FS = `
   precision mediump float;
   varying vec3 vWorldPos;
   varying float vDepth;
+  varying vec2 vFlow;
   uniform vec3 uCamPos;
   uniform vec3 uSunDir;
   uniform vec3 uSunColor;
@@ -537,56 +606,87 @@ const WATER_FS = `
     vec3 v = normalize(uCamPos - vWorldPos);
     float dist = length(uCamPos - vWorldPos);
 
-    // Dual-layer animated procedural normal map ripples (faded cleanly at far distance)
-    vec2 uv1 = vWorldPos.xz * 0.014 + vec2(uTime * 0.015, uTime * 0.010);
-    vec2 uv2 = vWorldPos.xz * 0.029 + vec2(-uTime * 0.012, uTime * 0.018);
+    // Flow-aligned water coordinate basis (channels scroll downstream, lakes drift gently)
+    float flowSpd = clamp(length(vFlow), 0.0, 1.0);
+    vec2 flowDir = flowSpd > 0.02 ? vFlow / flowSpd : vec2(0.0, 1.0);
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 flowCoord = vec2(dot(vWorldPos.xz, flowPerp), dot(vWorldPos.xz, flowDir));
+    float isRiver = smoothstep(0.35, 0.80, flowSpd);
+    vec2 stretch = mix(vec2(1.0, 1.0), vec2(1.65, 0.42), isRiver);
+    float tFlow = uTime * mix(0.035, 0.46, flowSpd);
+
+    // Dual-layer scrolling procedural normal ripples along current + counter-phase detail
+    vec2 uv1 = (flowCoord * stretch) * 0.015 - vec2(0.0, tFlow * 0.85) + vec2(uTime * 0.008, 0.0);
+    vec2 uv2 = (flowCoord * stretch) * 0.032 - vec2(0.0, tFlow * 1.52) - vec2(uTime * 0.011, 0.0);
     vec3 n1 = texture2D(uWaterNormalTex, uv1).xzy * 2.0 - 1.0;
     vec3 n2 = texture2D(uWaterNormalTex, uv2).xzy * 2.0 - 1.0;
-    float rippleFade = 1.0 - smoothstep(220.0, 1500.0, dist);
+    float rippleFade = 1.0 - smoothstep(420.0, 2600.0, dist);
     vec3 n = normalize(vec3(
-      (n1.x + n2.x * 0.75) * 0.24 * rippleFade,
+      (n1.x + n2.x * 0.85) * 0.36 * rippleFade,
       1.0,
-      (n1.z + n2.z * 0.75) * 0.24 * rippleFade
+      (n1.z + n2.z * 0.85) * 0.36 * rippleFade
     ));
     vec3 r = reflect(-v, n);
 
-    // Smoothly reflect sunset sky gradient + warm horizon bounce
-    float rh = clamp(r.y, 0.0, 1.0);
-    float t1 = smoothstep(0.0, 0.24, rh);
-    float t2 = smoothstep(0.20, 0.78, rh);
-    vec3 skyRefl = mix(uSkyHorizon, uSkyMid, t1);
+    // Reflect twilight sky gradient without purple wash so lakes read as crisp blue-gold water
+    float rh = clamp(r.y + 0.16, 0.0, 1.0);
+    float t1 = smoothstep(0.0, 0.28, rh);
+    float t2 = smoothstep(0.24, 0.80, rh);
+    vec3 waterSkyMid = vec3(0.34, 0.42, 0.56);
+    vec3 skyRefl = mix(uSkyHorizon * vec3(0.96, 0.98, 1.02), waterSkyMid, t1);
     skyRefl = mix(skyRefl, uSkyZenith, t2);
-    float horizGlow = pow(1.0 - clamp(abs(r.y), 0.0, 1.0), 4.5);
-    skyRefl += vec3(0.26, 0.12, 0.03) * horizGlow;
+    float horizGlow = pow(1.0 - clamp(abs(r.y + 0.06), 0.0, 1.0), 4.5);
+    skyRefl += vec3(0.18, 0.10, 0.03) * horizGlow;
 
-    float fresnel = clamp(0.14 + 0.86 * pow(1.0 - max(v.y, 0.0), 3.4), 0.0, 1.0);
-    vec3 waterBody = mix(uWaterShallow, uWaterDeep, smoothstep(0.0, 0.55, vDepth));
+    // Glacial alpine tarns (y > 40m) retain rich mineral turquoise-sapphire color so they never read snow-white
+    float isAlpine = smoothstep(40.0, 120.0, vWorldPos.y);
+    float fresnel = clamp(0.12 + 0.88 * pow(1.0 - max(v.y, 0.0), 3.4), 0.0, 1.0);
+    vec3 alpineShallow = vec3(0.11, 0.40, 0.46);
+    vec3 alpineDeep = vec3(0.03, 0.17, 0.29);
+    vec3 deepCol = mix(uWaterDeep, alpineDeep, isAlpine);
+    vec3 shallowCol = mix(uWaterShallow, alpineShallow, isAlpine);
+    vec3 waterBody = mix(shallowCol, deepCol, smoothstep(0.0, 0.58, vDepth));
+
     if (uHasWaterPhoto > 0.5) {
-      vec3 w1 = texture2D(uWaterPhotoTex, vWorldPos.xz * 0.0028 + vec2(uTime * 0.007, uTime * 0.005)).rgb;
-      vec3 w2 = texture2D(uWaterPhotoTex, vWorldPos.xz * 0.0046 + vec2(-uTime * 0.005, uTime * 0.008)).rgb;
-      vec3 photoWater = pow(mix(w1, w2, 0.45), vec3(1.22)) * 1.15;
-      waterBody = mix(uWaterShallow, photoWater, smoothstep(0.04, 0.45, vDepth));
+      vec2 pw1 = (flowCoord * stretch) * 0.0030 - vec2(0.0, tFlow * 0.24);
+      vec2 pw2 = (flowCoord * stretch) * 0.0058 - vec2(0.0, tFlow * 0.41) + vec2(0.27, 0.0);
+      vec3 w1 = texture2D(uWaterPhotoTex, pw1).rgb;
+      vec3 w2 = texture2D(uWaterPhotoTex, pw2).rgb;
+      vec3 photoWater = pow(mix(w1, w2, 0.45), vec3(1.24)) * mix(1.12, 0.62, isAlpine);
+      photoWater = mix(photoWater, deepCol * 1.35, isAlpine * 0.65);
+      waterBody = mix(shallowCol, photoWater, smoothstep(0.04, 0.48, vDepth));
     }
-    vec3 base = mix(waterBody, skyRefl, fresnel * 0.82);
+    // Directional river stream streaks for clear static-frame flow reading
+    float streamStreak = sin((uv1.x * 3.8 + n1.x * 1.4)) * 0.5 + 0.5;
+    waterBody *= mix(1.0, 0.90 + 0.20 * streamStreak, isRiver * rippleFade);
 
-    // Blinn-Phong sun-glint core + animated micro-wave sparkle streak
+    vec3 base = mix(waterBody, skyRefl, fresnel * mix(0.46, 0.24, isAlpine));
+
+    // Moving Blinn-Phong sun-glint core + animated micro-wave sparkle streaks driven by scrolled normals
     vec3 h = normalize(l + v);
     float ndh = max(dot(n, h), 0.0);
-    float sunCore = pow(ndh, 260.0) * 2.10;
-    float sunBloom = pow(ndh, 26.0) * 0.40;
+    float sunCore = pow(ndh, 240.0) * 2.25;
+    float sunBloom = pow(ndh, 26.0) * 0.42;
     vec2 viewXZ = normalize(vec2(-v.x, -v.z) + vec2(1e-5));
     vec2 sunXZ = normalize(vec2(l.x, l.z) + vec2(1e-5));
     float azAlign = max(dot(viewXZ, sunXZ), 0.0);
-    float sparkle = 0.65 + 1.65 * pow(ndh, 36.0);
-    float glintPath = pow(azAlign, 18.0) * smoothstep(0.62, 0.02, v.y) * 0.48 * sparkle;
+    float sparkle = 0.55 + 2.15 * pow(ndh, 30.0);
+    float glintPath = pow(azAlign, 18.0) * smoothstep(0.62, 0.02, v.y) * 0.46 * sparkle * mix(1.0, 0.48, isAlpine);
     vec3 col = base + uSunColor * (sunCore + sunBloom + glintPath);
+
+    // Subtle shoreline foam & waterline ring where water meets banks
+    float shoreNoise = texture2D(uWaterNormalTex, vWorldPos.xz * 0.048 - vFlow * uTime * 0.14).g;
+    float shoreBand = (1.0 - smoothstep(0.02, 0.24, vDepth)) * smoothstep(0.0, 0.04, vDepth);
+    float foamMask = shoreBand * smoothstep(0.28, 0.72, shoreNoise + 0.20);
+    col = mix(col, vec3(0.84, 0.89, 0.92), clamp(foamMask * mix(0.55, 0.72, isRiver + isAlpine * 0.4), 0.0, 0.75));
+
     col *= mix(0.86, 1.00, (cloudShadowFactor(vWorldPos.xz, uTime) - 0.80) / 0.20);
 
-    float fog = 1.0 - exp(-pow(dist * uFogDensity, 1.65));
+    float fog = 1.0 - exp(-pow(dist * uFogDensity * 0.85, 1.65));
     float sunAmt = pow(max(dot(-v, l), 0.0), 5.0);
     vec3 fogCol = mix(uFogColor, uSunColor * 0.95, sunAmt * 0.45);
     vec3 finalCol = mix(col, fogCol, clamp(fog, 0.0, 1.0));
-    float shoreAlpha = clamp(smoothstep(0.0, 0.15, vDepth) * 0.94 + fresnel * 0.18, 0.0, 1.0);
+    float shoreAlpha = clamp(smoothstep(0.0, 0.14, vDepth) * 0.95 + fresnel * 0.18 + foamMask * 0.25, 0.0, 1.0);
     gl_FragColor = vec4(gradeAndToneMap(finalCol), shoreAlpha);
   }
 `;
@@ -624,12 +724,14 @@ const CLOUD_FS = `
   varying vec3 vNormal;
   varying vec3 vColor;
   uniform vec3 uCamPos;
+  uniform vec3 uPlanePos;
   uniform vec3 uSunDir;
   uniform vec3 uSunColor;
   uniform vec3 uFogColor;
   uniform float uFogDensity;
   uniform sampler2D uDetailTex;
   uniform float uDepthOnly;
+  uniform float uIsMist;
   ${TONEMAP_GLSL}
 
   void main() {
@@ -640,28 +742,39 @@ const CLOUD_FS = `
     vec3 v = toCam / max(dist, 1e-4);
     float ndv = max(dot(n, v), 0.0);
 
+    // Near-fade around both camera and aircraft so no sprite/puff ever intersects or hugs the plane
+    float camNearFade = smoothstep(uIsMist > 0.5 ? 55.0 : 105.0, uIsMist > 0.5 ? 105.0 : 210.0, dist);
+    float planeDist = length(uPlanePos - vWorldPos);
+    float planeNearFade = smoothstep(uIsMist > 0.5 ? 42.0 : 110.0, uIsMist > 0.5 ? 82.0 : 220.0, planeDist);
+    float nearFade = camNearFade * planeNearFade;
+
     // Two-octave internal vapor detail for soft photographic puff breakup
     float n1 = texture2D(uDetailTex, vWorldPos.xz * 0.0055 + vec2(vWorldPos.y * 0.004)).r;
     float n2 = texture2D(uDetailTex, vWorldPos.xz * 0.0155 - vec2(vWorldPos.y * 0.008)).r;
     float puffNoise = n1 * 0.65 + n2 * 0.35;
 
-    // Gentle wide Fresnel feathering and natural cloud translucency (no opaque blob / cutoff)
-    float fresnelFade = pow(max(ndv, 1e-4), 1.65);
-    float alpha = clamp(fresnelFade * (0.56 + 0.50 * puffNoise) * 0.84, 0.0, 0.86);
+    // Gentle wide Fresnel feathering and natural cloud/mist translucency (no opaque blob / cutoff)
+    float fresnelFade = pow(max(ndv, 1e-4), uIsMist > 0.5 ? 3.2 : 1.65);
+    float baseAlpha = uIsMist > 0.5
+      ? clamp(fresnelFade * (0.08 + 0.14 * puffNoise), 0.0, 0.18)
+      : clamp(fresnelFade * (0.56 + 0.50 * puffNoise) * 0.84, 0.0, 0.86);
+    float alpha = baseAlpha * nearFade;
     if (uDepthOnly > 0.5) {
       if (alpha < 0.04) discard;
       gl_FragColor = vec4(1.0);
       return;
     }
 
-    // Effectively unlit vertical gradient: warm pink/amber base -> soft white mid -> warm white crown
+    // Effectively unlit vertical gradient: warm amber-cream base -> soft white mid -> warm white crown
     float topBias = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 baseCol = vec3(0.94, 0.80, 0.72);
-    vec3 midCol = vec3(0.99, 0.93, 0.88);
-    vec3 crownCol = vec3(1.05, 1.00, 0.94);
-    vec3 gradCol = topBias < 0.5
-      ? mix(baseCol, midCol, topBias * 2.0)
-      : mix(midCol, crownCol, (topBias - 0.5) * 2.0);
+    vec3 baseCol = vec3(0.95, 0.84, 0.76);
+    vec3 midCol = vec3(0.99, 0.94, 0.90);
+    vec3 crownCol = vec3(1.05, 1.01, 0.96);
+    vec3 gradCol = uIsMist > 0.5
+      ? vec3(0.92, 0.88, 0.84)
+      : (topBias < 0.5
+        ? mix(baseCol, midCol, topBias * 2.0)
+        : mix(midCol, crownCol, (topBias - 0.5) * 2.0));
 
     // Gentle sun-side & silver-lining tint: strictly additive, never subtracts below gradient base
     float sunSide = smoothstep(-0.35, 0.90, dot(n, l));
@@ -671,11 +784,11 @@ const CLOUD_FS = `
     col += uSunColor * (0.14 * sunSide + backScatter * (0.16 + 0.14 * (1.0 - ndv)));
 
     // Distance fog toward bright warm fog/sun color, followed by hard brightness floor
-    float fog = 1.0 - exp(-pow(max(dist * uFogDensity * 0.65, 1e-4), 1.65));
+    float fog = 1.0 - exp(-pow(max(dist * uFogDensity * (uIsMist > 0.5 ? 0.25 : 0.65), 1e-4), 1.65));
     float sunAmt = pow(max(dot(-v, l), 1e-4), 5.0);
-    vec3 fogCol = mix(max(uFogColor, vec3(0.80, 0.60, 0.50)), uSunColor * 0.98, sunAmt * 0.45);
+    vec3 fogCol = mix(max(uFogColor, vec3(0.82, 0.64, 0.52)), uSunColor * 0.98, sunAmt * 0.45);
     vec3 finalCol = mix(col, fogCol, clamp(fog, 0.0, 1.0));
-    finalCol = max(finalCol, vec3(0.62, 0.58, 0.60));
+    finalCol = max(finalCol, uIsMist > 0.5 ? vec3(0.84, 0.80, 0.76) : vec3(0.64, 0.62, 0.61));
     gl_FragColor = vec4(gradeAndToneMap(finalCol), alpha);
   }
 `;
@@ -814,20 +927,25 @@ const WATERFALL_FS = `
     float alpha;
 
     if (uIsFoam > 0.5) {
-      float rad = length(vUv);
+      float swirl = vNoise2(vWorldPos.xz * 0.14 + vec2(0.0, -uTime * 0.55)) * 0.28
+                  + vNoise2(vWorldPos.xz * 0.34 + vec2(uTime * 0.2, -uTime * 0.9)) * 0.14;
+      float rad = length(vUv) + (swirl - 0.21);
       if (rad > 1.0) discard;
-      float ring = 0.55 + 0.45 * sin(rad * 16.0 - uTime * 3.4);
-      float edgeFade = 1.0 - smoothstep(0.28, 1.0, rad);
-      vec3 texFoam = vec3(0.92, 0.94, 0.96);
+      float ring = 0.58 + 0.42 * sin(rad * 16.0 - uTime * 3.4);
+      float edgeFade = pow(1.0 - smoothstep(0.16, 0.98, rad), 1.65);
+      float coreFoam = 1.0 - smoothstep(0.0, 0.52, rad);
+      vec3 texFoam = vec3(0.94, 0.96, 0.98);
       if (uHasWaterfallTex > 0.5) {
         vec2 fUv = vUv * 0.48 + vec2(0.5, 0.72 - uTime * 0.08);
         texFoam = texture2D(uWaterfallTex, fUv).rgb;
       }
       float luma = dot(texFoam, vec3(0.3, 0.59, 0.11));
-      col = mix(vec3(0.76, 0.83, 0.88), vec3(1.06, 0.99, 0.93), clamp(luma * 1.25 * ring, 0.0, 1.0));
-      alpha = edgeFade * (0.48 + 0.42 * luma * ring);
+      col = mix(vec3(0.84, 0.90, 0.94), vec3(1.14, 1.09, 1.04), clamp(luma * 1.28 * ring + coreFoam * 0.25, 0.0, 1.0));
+      alpha = edgeFade * clamp(0.56 + 0.44 * luma * ring + coreFoam * 0.22, 0.0, 0.95);
     } else {
       float sideFeather = smoothstep(0.0, 0.14, vUv.x) * (1.0 - smoothstep(0.86, 1.0, vUv.x));
+      float topFade = 0.28 + 0.72 * smoothstep(0.0, 0.16, vUv.y);
+      float botFade = 1.0 - smoothstep(1.54, 2.16, vUv.y);
       vec2 uv1 = vec2(vUv.x * 1.35, vUv.y - uTime * 0.65);
       vec2 uv2 = vec2(vUv.x * 2.05 + 0.37, vUv.y * 1.38 - uTime * 0.98);
       vec3 s1 = vec3(0.82, 0.88, 0.94);
@@ -844,11 +962,11 @@ const WATERFALL_FS = `
       vec3 blended = max(s1, s2 * 0.92) + s1 * s2 * 0.38;
       float streak = clamp(dot(blended, vec3(0.28, 0.58, 0.14)), 0.0, 1.2);
       vec3 wetRock = vec3(0.24, 0.27, 0.31) * vColor;
-      vec3 whiteWater = vec3(1.04, 0.97, 0.91) + uSunColor * 0.12;
-      col = mix(wetRock, whiteWater, smoothstep(0.22, 0.86, streak));
-      float baseSplash = smoothstep(1.5, 2.2, vUv.y);
-      col = mix(col, vec3(1.08, 1.02, 0.96), baseSplash * 0.35);
-      alpha = sideFeather * clamp(0.42 + streak * 0.58 + baseSplash * 0.25, 0.0, 0.96);
+      vec3 whiteWater = vec3(1.06, 1.00, 0.94) + uSunColor * 0.12;
+      col = mix(wetRock, whiteWater, smoothstep(0.20, 0.84, streak));
+      float baseSplash = smoothstep(1.45, 2.15, vUv.y);
+      col = mix(col, vec3(1.12, 1.06, 1.00), baseSplash * 0.45);
+      alpha = sideFeather * topFade * botFade * clamp(0.46 + streak * 0.56 + baseSplash * 0.24, 0.0, 0.96);
     }
 
     float fog = 1.0 - exp(-pow(max(dist * uFogDensity * 0.85, 1e-4), 1.65));
@@ -1091,7 +1209,7 @@ export function createRenderer3D(canvas, random) {
     return c;
   }
 
-  function toPotCanvas(img, maxW = 2048, maxH = 2048) {
+  function toPotCanvas(img, maxW = 2048, maxH = 2048, makeSeamless = false) {
     const pow2 = (n, cap) => {
       let p = 1;
       while (p * 2 <= cap && Math.abs(p * 2 - n) <= Math.abs(p - n)) p *= 2;
@@ -1106,10 +1224,40 @@ export function createRenderer3D(canvas, random) {
     cx.imageSmoothingEnabled = true;
     cx.imageSmoothingQuality = 'high';
     cx.drawImage(img, 0, 0, w, h);
+
+    // Cross-fade a half-shifted copy across a narrow 14% border band so non-tileable rock photos repeat seamlessly
+    if (makeSeamless) {
+      const imgData = cx.getImageData(0, 0, w, h);
+      const src = imgData.data;
+      const out = new Uint8ClampedArray(src);
+      const hw = w >> 1;
+      const hh = h >> 1;
+      const margin = 0.14;
+      for (let y = 0; y < h; y += 1) {
+        const v = y / h;
+        const dv = Math.min(v, 1 - v);
+        const sy = (y + hh) % h;
+        for (let x = 0; x < w; x += 1) {
+          const u = x / w;
+          const dEdge = Math.min(Math.min(u, 1 - u), dv);
+          if (dEdge >= margin) continue;
+          const t = dEdge / margin;
+          const keep = t * t * (3 - 2 * t);
+          const sx = (x + hw) % w;
+          const dstIdx = (y * w + x) * 4;
+          const srcIdx = (sy * w + sx) * 4;
+          out[dstIdx] = Math.round(src[srcIdx] + (src[dstIdx] - src[srcIdx]) * keep);
+          out[dstIdx + 1] = Math.round(src[srcIdx + 1] + (src[dstIdx + 1] - src[srcIdx + 1]) * keep);
+          out[dstIdx + 2] = Math.round(src[srcIdx + 2] + (src[dstIdx + 2] - src[srcIdx + 2]) * keep);
+        }
+      }
+      imgData.data.set(out);
+      cx.putImageData(imgData, 0, 0);
+    }
     return c;
   }
 
-  function loadPhotoTexture(url, fallbackCanvas, wrapS, wrapT, maxW = 2048, maxH = 2048) {
+  function loadPhotoTexture(url, fallbackCanvas, wrapS, wrapT, maxW = 2048, maxH = 2048, makeSeamless = false) {
     const stateObj = {
       tex: createCanvasTexture(fallbackCanvas, wrapS, wrapT),
       loaded: false,
@@ -1129,7 +1277,7 @@ export function createRenderer3D(canvas, random) {
       const timer = setTimeout(done, 6000);
       const img = new Image();
       img.onload = () => {
-        const pot = toPotCanvas(img, maxW, maxH);
+        const pot = toPotCanvas(img, maxW, maxH, makeSeamless);
         gl.bindTexture(gl.TEXTURE_2D, stateObj.tex);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, pot);
@@ -1161,19 +1309,20 @@ export function createRenderer3D(canvas, random) {
   gl.bindTexture(gl.TEXTURE_2D, null);
 
   const groundTex = createCanvasTexture(buildGroundTextureCanvas(), gl.CLAMP_TO_EDGE, gl.CLAMP_TO_EDGE);
+  const farmMaskTex = createCanvasTexture(buildFarmMaskCanvas(), gl.CLAMP_TO_EDGE, gl.CLAMP_TO_EDGE, false);
   const detailTex = createCanvasTexture(buildDetailTextureCanvas(), gl.REPEAT, gl.REPEAT);
   const runwayFallbackCanvas = buildRunwayTextureCanvas();
   const runwayDecalTex = createCanvasTexture(buildRunwayDecalCanvas(), gl.CLAMP_TO_EDGE, gl.CLAMP_TO_EDGE);
   const waterNormalTex = createCanvasTexture(buildWaterNormalCanvas(), gl.REPEAT, gl.REPEAT);
 
   const skyPhoto = loadPhotoTexture('./assets/tex-sky.jpg', makeSolidColorCanvas(160, 110, 100), gl.MIRRORED_REPEAT, gl.CLAMP_TO_EDGE, 2048, 1024);
-  const groundPhoto = loadPhotoTexture('./assets/tex-ground.jpg', makeSolidColorCanvas(180, 185, 160), gl.MIRRORED_REPEAT, gl.MIRRORED_REPEAT, 1024, 1024);
-  const waterPhoto = loadPhotoTexture('./assets/tex-water.jpg', makeSolidColorCanvas(32, 74, 88), gl.MIRRORED_REPEAT, gl.MIRRORED_REPEAT, 1024, 1024);
+  const groundPhoto = loadPhotoTexture('./assets/tex-ground.jpg', makeSolidColorCanvas(180, 185, 160), gl.MIRRORED_REPEAT, gl.MIRRORED_REPEAT, 2048, 2048);
+  const waterPhoto = loadPhotoTexture('./assets/tex-water.jpg', makeSolidColorCanvas(32, 74, 88), gl.REPEAT, gl.REPEAT, 1024, 1024, true);
   const mountainPhoto = loadPhotoTexture('./assets/tex-mountains.jpg', makeSolidColorCanvas(115, 100, 96), gl.MIRRORED_REPEAT, gl.CLAMP_TO_EDGE, 2048, 1024);
   const runwayPhoto = loadPhotoTexture('./assets/tex-runway.jpg', runwayFallbackCanvas, gl.CLAMP_TO_EDGE, gl.MIRRORED_REPEAT, 1024, 1024);
-  const rockPhoto = loadPhotoTexture('./assets/tex-rock.jpg', makeSolidColorCanvas(164, 88, 60), gl.MIRRORED_REPEAT, gl.MIRRORED_REPEAT, 1024, 1024);
-  const snowrockPhoto = loadPhotoTexture('./assets/tex-snowrock.jpg', makeSolidColorCanvas(150, 155, 164), gl.MIRRORED_REPEAT, gl.MIRRORED_REPEAT, 1024, 1024);
-  const waterfallPhoto = loadPhotoTexture('./assets/tex-waterfall.jpg', makeSolidColorCanvas(215, 225, 235), gl.MIRRORED_REPEAT, gl.REPEAT, 1024, 1024);
+  const rockPhoto = loadPhotoTexture('./assets/tex-rock.jpg', makeSolidColorCanvas(164, 88, 60), gl.REPEAT, gl.REPEAT, 2048, 1024, true);
+  const snowrockPhoto = loadPhotoTexture('./assets/tex-snowrock.jpg', makeSolidColorCanvas(150, 155, 164), gl.REPEAT, gl.REPEAT, 2048, 1024, true);
+  const waterfallPhoto = loadPhotoTexture('./assets/tex-waterfall.jpg', makeSolidColorCanvas(215, 225, 235), gl.MIRRORED_REPEAT, gl.REPEAT, 2048, 1024);
   const ready = Promise.all([
     skyPhoto.promise,
     groundPhoto.promise,
@@ -1196,8 +1345,8 @@ export function createRenderer3D(canvas, random) {
   const airfieldGpu = uploadMesh(gl, buildAirfieldMesh());
   const villageGpu = uploadMesh(gl, buildVillageMesh());
   const emissiveGpu = uploadMesh(gl, buildEmissiveMesh());
+  const cloudsGpu = uploadMesh(gl, buildCloudsMesh(createRandom(77)));
   const treesGpu = uploadMesh(gl, buildTreesMesh(random));
-  const cloudsGpu = uploadMesh(gl, buildCloudsMesh(random));
   const planeGpu = uploadMesh(gl, buildPlaneMesh());
   const propGpu = uploadMesh(gl, buildPropellerMesh());
   const propDiscGpu = uploadMesh(gl, buildPropDiscMesh());
@@ -1318,6 +1467,7 @@ export function createRenderer3D(canvas, random) {
     uPhotoGroundTex: gl.getUniformLocation(solidProg, 'uPhotoGroundTex'),
     uRockTex: gl.getUniformLocation(solidProg, 'uRockTex'),
     uSnowrockTex: gl.getUniformLocation(solidProg, 'uSnowrockTex'),
+    uFarmMaskTex: gl.getUniformLocation(solidProg, 'uFarmMaskTex'),
     uUseAlbedoTex: gl.getUniformLocation(solidProg, 'uUseAlbedoTex'),
     uUseDetailTex: gl.getUniformLocation(solidProg, 'uUseDetailTex'),
     uUsePhotoGround: gl.getUniformLocation(solidProg, 'uUsePhotoGround'),
@@ -1374,6 +1524,7 @@ export function createRenderer3D(canvas, random) {
     aCenter: gl.getAttribLocation(cloudProg, 'aCenter'),
     uProjView: gl.getUniformLocation(cloudProg, 'uProjView'),
     uCamPos: gl.getUniformLocation(cloudProg, 'uCamPos'),
+    uPlanePos: gl.getUniformLocation(cloudProg, 'uPlanePos'),
     uSunDir: gl.getUniformLocation(cloudProg, 'uSunDir'),
     uSunColor: gl.getUniformLocation(cloudProg, 'uSunColor'),
     uFogColor: gl.getUniformLocation(cloudProg, 'uFogColor'),
@@ -1383,6 +1534,7 @@ export function createRenderer3D(canvas, random) {
     uWorldHalf: gl.getUniformLocation(cloudProg, 'uWorldHalf'),
     uDetailTex: gl.getUniformLocation(cloudProg, 'uDetailTex'),
     uDepthOnly: gl.getUniformLocation(cloudProg, 'uDepthOnly'),
+    uIsMist: gl.getUniformLocation(cloudProg, 'uIsMist'),
   };
 
   const emissiveLoc = {
@@ -1492,9 +1644,18 @@ export function createRenderer3D(canvas, random) {
     passTimes: new Array(MISSION_RINGS.length).fill(-1),
   };
 
+  const yokeState = {
+    roll: 0,
+    pitch: 0,
+    initialized: false,
+  };
+
   function resetCamera(plane) {
     camState.initialized = false;
     camState.prevElapsed = 0;
+    yokeState.initialized = false;
+    yokeState.roll = 0;
+    yokeState.pitch = 0;
     ringFadeState.prevPassed = 0;
     ringFadeState.fovKickStart = -100;
     ringFadeState.passTimes.fill(-1);
@@ -1590,21 +1751,53 @@ export function createRenderer3D(canvas, random) {
   }
 
   function updateCamera(state, isTitle, snapImmediate, dt) {
+    if (state.shotCam) {
+      camState.pos.x = state.shotCam.pos.x;
+      camState.pos.y = state.shotCam.pos.y;
+      camState.pos.z = state.shotCam.pos.z;
+      camState.target.x = state.shotCam.target.x;
+      camState.target.y = state.shotCam.target.y;
+      camState.target.z = state.shotCam.target.z;
+      camState.up.x = 0;
+      camState.up.y = 1;
+      camState.up.z = 0;
+      camState.isCockpit = false;
+      camState.prevCamMode = state.camMode;
+      camState.initialized = true;
+      return;
+    }
     const p = state.plane;
     const isCockpit = state.camMode === 2;
     camState.isCockpit = isCockpit;
     const modeChanged = camState.prevCamMode !== state.camMode;
     camState.prevCamMode = state.camMode;
 
-    if (isCockpit) {
-      // First-person pilot seat: zero positional lag, crisp cockpit alignment
-      desiredPosTmp.x = p.pos.x + p.right.x * COCKPIT_EYE.x + p.up.x * COCKPIT_EYE.y - p.forward.x * COCKPIT_EYE.z;
-      desiredPosTmp.y = p.pos.y + p.right.y * COCKPIT_EYE.x + p.up.y * COCKPIT_EYE.y - p.forward.y * COCKPIT_EYE.z;
-      desiredPosTmp.z = p.pos.z + p.right.z * COCKPIT_EYE.x + p.up.z * COCKPIT_EYE.y - p.forward.z * COCKPIT_EYE.z;
+    // Smoothly ease cockpit yoke linkage & subtle viewpoint sway toward live control input
+    const ctrl = state.lastControls || { pitch: 0, roll: 0 };
+    const targetRoll = clamp(ctrl.roll || 0, -1, 1);
+    const targetPitch = clamp(ctrl.pitch || 0, -1, 1);
+    if (!yokeState.initialized || snapImmediate || modeChanged || dt <= 0) {
+      yokeState.roll = targetRoll;
+      yokeState.pitch = targetPitch;
+      yokeState.initialized = true;
+    } else {
+      const yAlpha = 1 - Math.exp(-13.0 * dt);
+      yokeState.roll = lerp(yokeState.roll, targetRoll, yAlpha);
+      yokeState.pitch = lerp(yokeState.pitch, targetPitch, yAlpha);
+    }
 
-      desiredTargetTmp.x = desiredPosTmp.x + (p.forward.x + p.up.x * COCKPIT_LOOK_PITCH) * 28;
-      desiredTargetTmp.y = desiredPosTmp.y + (p.forward.y + p.up.y * COCKPIT_LOOK_PITCH) * 28;
-      desiredTargetTmp.z = desiredPosTmp.z + (p.forward.z + p.up.z * COCKPIT_LOOK_PITCH) * 28;
+    if (isCockpit) {
+      // First-person pilot seat with subtle control-input viewpoint sway
+      const swayX = COCKPIT_EYE.x + yokeState.roll * 0.018;
+      const swayY = COCKPIT_EYE.y - yokeState.pitch * 0.012;
+      desiredPosTmp.x = p.pos.x + p.right.x * swayX + p.up.x * swayY - p.forward.x * COCKPIT_EYE.z;
+      desiredPosTmp.y = p.pos.y + p.right.y * swayX + p.up.y * swayY - p.forward.y * COCKPIT_EYE.z;
+      desiredPosTmp.z = p.pos.z + p.right.z * swayX + p.up.z * swayY - p.forward.z * COCKPIT_EYE.z;
+
+      const lookPitch = COCKPIT_LOOK_PITCH + yokeState.pitch * 0.012;
+      desiredTargetTmp.x = desiredPosTmp.x + (p.forward.x + p.up.x * lookPitch) * 28;
+      desiredTargetTmp.y = desiredPosTmp.y + (p.forward.y + p.up.y * lookPitch) * 28;
+      desiredTargetTmp.z = desiredPosTmp.z + (p.forward.z + p.up.z * lookPitch) * 28;
 
       camState.pos.x = desiredPosTmp.x;
       camState.pos.y = desiredPosTmp.y;
@@ -1726,7 +1919,7 @@ export function createRenderer3D(canvas, random) {
 
     const aspect = canvas.width / Math.max(1, canvas.height);
     const speedRatio = clamp((state.plane.speed - 25) / 45, 0, 1);
-    const baseFovDeg = state.camMode === 2 ? 58 + speedRatio * 2 : 55 + speedRatio * 7;
+    const baseFovDeg = state.camMode === 2 ? 60 + speedRatio * 2 : 55 + speedRatio * 7;
     let fovDeg = baseFovDeg;
     if (ringFadeState.fovKickStart >= 0) {
       const kickDt = state.elapsed - ringFadeState.fovKickStart;
@@ -1894,6 +2087,9 @@ export function createRenderer3D(canvas, random) {
     gl.activeTexture(gl.TEXTURE5);
     gl.bindTexture(gl.TEXTURE_2D, snowrockPhoto.stateObj.tex);
     gl.uniform1i(solidLoc.uSnowrockTex, 5);
+    gl.activeTexture(gl.TEXTURE6);
+    gl.bindTexture(gl.TEXTURE_2D, farmMaskTex);
+    gl.uniform1i(solidLoc.uFarmMaskTex, 6);
 
     gl.uniform1f(solidLoc.uShadowEnabled, shadowSupported ? 1.0 : 0.0);
     gl.uniform1f(solidLoc.uShadowTexel, 1.0 / SHADOW_SIZE);
@@ -2006,6 +2202,7 @@ export function createRenderer3D(canvas, random) {
     gl.uniform1i(cloudLoc.uDetailTex, 0);
     gl.uniformMatrix4fv(cloudLoc.uProjView, false, projViewMat);
     gl.uniform3f(cloudLoc.uCamPos, camState.pos.x, camState.pos.y, camState.pos.z);
+    gl.uniform3f(cloudLoc.uPlanePos, p.pos.x, p.pos.y, p.pos.z);
     gl.uniform3fv(cloudLoc.uSunDir, PALETTE.sunDir);
     gl.uniform3fv(cloudLoc.uSunColor, PALETTE.sunColor);
     gl.uniform3fv(cloudLoc.uFogColor, WARM_FOG);
@@ -2013,6 +2210,7 @@ export function createRenderer3D(canvas, random) {
     gl.uniform2f(cloudLoc.uDrift, state.elapsed * 3.2, state.elapsed * 1.1);
     gl.uniform1f(cloudLoc.uWorldSize, WORLD.size);
     gl.uniform1f(cloudLoc.uWorldHalf, WORLD.half);
+    gl.uniform1f(cloudLoc.uIsMist, 0.0);
     bindSolidMesh(cloudsGpu, cloudLoc);
     gl.bindBuffer(gl.ARRAY_BUFFER, cloudsGpu.centerBuf);
     gl.enableVertexAttribArray(cloudLoc.aCenter);
@@ -2095,13 +2293,15 @@ export function createRenderer3D(canvas, random) {
     gl.drawArrays(gl.TRIANGLES, 0, waterfallFoamGpu.vertexCount);
     disableSolidMesh(waterfallLoc);
 
-    // Waterfall mist puffs (reuses unlit cloud shader + brightness floor)
+    // Waterfall mist puffs (reuses unlit cloud shader with soft additive spray so white foam is never darkened)
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.useProgram(cloudProg);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, detailTex);
     gl.uniform1i(cloudLoc.uDetailTex, 0);
     gl.uniformMatrix4fv(cloudLoc.uProjView, false, projViewMat);
     gl.uniform3f(cloudLoc.uCamPos, camState.pos.x, camState.pos.y, camState.pos.z);
+    gl.uniform3f(cloudLoc.uPlanePos, p.pos.x, p.pos.y, p.pos.z);
     gl.uniform3fv(cloudLoc.uSunDir, PALETTE.sunDir);
     gl.uniform3fv(cloudLoc.uSunColor, PALETTE.sunColor);
     gl.uniform3fv(cloudLoc.uFogColor, WARM_FOG);
@@ -2110,6 +2310,7 @@ export function createRenderer3D(canvas, random) {
     gl.uniform1f(cloudLoc.uWorldSize, WORLD.size);
     gl.uniform1f(cloudLoc.uWorldHalf, WORLD.half);
     gl.uniform1f(cloudLoc.uDepthOnly, 0.0);
+    gl.uniform1f(cloudLoc.uIsMist, 1.0);
     bindSolidMesh(waterfallMistGpu, cloudLoc);
     gl.bindBuffer(gl.ARRAY_BUFFER, waterfallMistGpu.centerBuf);
     gl.enableVertexAttribArray(cloudLoc.aCenter);
@@ -2316,9 +2517,9 @@ export function createRenderer3D(canvas, random) {
     bindSolidMesh(cockpitFaceGpu, solidLoc);
     gl.drawArrays(gl.TRIANGLES, 0, cockpitFaceGpu.vertexCount);
 
-    // Twin-grip yoke deflected by pitch & roll input
-    const yokePitchPush = -clamp(ctrl.pitch, -1, 1) * 0.055;
-    const yokeRollAngle = clamp(ctrl.roll, -1, 1) * 0.48;
+    // Twin-grip yoke smoothly deflected with unmissable roll rotation (~68°) & pitch travel (±8.5 cm)
+    const yokePitchPush = -clamp(yokeState.pitch, -1, 1) * 0.085;
+    const yokeRollAngle = clamp(yokeState.roll, -1, 1) * 1.18;
     const cy = Math.cos(yokeRollAngle);
     const sy = Math.sin(yokeRollAngle);
     propRightTmp.x = p.right.x * cy - p.up.x * sy;
@@ -2327,10 +2528,11 @@ export function createRenderer3D(canvas, random) {
     propUpTmp.x = p.right.x * sy + p.up.x * cy;
     propUpTmp.y = p.right.y * sy + p.up.y * cy;
     propUpTmp.z = p.right.z * sy + p.up.z * cy;
-    const yzLocal = -1.55 - yokePitchPush;
-    propPosTmp.x = p.pos.x + p.up.x * 0.255 - p.forward.x * yzLocal;
-    propPosTmp.y = p.pos.y + p.up.y * 0.255 - p.forward.y * yzLocal;
-    propPosTmp.z = p.pos.z + p.up.z * 0.255 - p.forward.z * yzLocal;
+    const yzLocal = -1.56 - yokePitchPush;
+    const yokeMountY = 0.285 + clamp(yokeState.pitch, -1, 1) * 0.010;
+    propPosTmp.x = p.pos.x + p.up.x * yokeMountY - p.forward.x * yzLocal;
+    propPosTmp.y = p.pos.y + p.up.y * yokeMountY - p.forward.y * yzLocal;
+    propPosTmp.z = p.pos.z + p.up.z * yokeMountY - p.forward.z * yzLocal;
     mat4FromBasis(yokeMat, propPosTmp, propRightTmp, propUpTmp, p.forward, 1.0);
     gl.uniformMatrix4fv(solidLoc.uModel, false, yokeMat);
     gl.uniform1f(solidLoc.uUseAlbedoTex, 0.0);
