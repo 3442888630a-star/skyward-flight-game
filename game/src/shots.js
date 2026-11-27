@@ -31,37 +31,37 @@ export function stageShot(name, world) {
   const p = st.plane;
 
   if (name === 'play') {
-    // Mid-flight over snow mountain ranges toward sunset with active combo multiplier
+    // Mountain-system panorama: high over the joined alpine cordillera overlooking Glacier Tarn, colorful foothills & snow peaks
     st.camMode = 0;
-    st.ringsPassed = 3;
-    st.ringScore = 1550;
-    st.ringCombo = 3;
-    st.maxCombo = 3;
-    st.comboMult = 2;
+    st.ringsPassed = 2;
+    st.ringScore = 950;
+    st.ringCombo = 2;
+    st.maxCombo = 2;
+    st.comboMult = 1;
     st.perfectRings = 2;
-    st.goodRings = 1;
-    st.missionTime = 164.0;
-    p.fuel = 64;
-    p.pos.x = -1820;
-    p.pos.y = 685;
-    p.pos.z = -1520;
+    st.goodRings = 0;
+    st.missionTime = 98.5;
+    p.fuel = 79;
+    p.pos.x = -1260;
+    p.pos.y = 625;
+    p.pos.z = -880;
     p.speed = 46;
     p.throttle = 0.68;
-    world.setBasisFromHeadingPitchRoll(-0.88, 0.02, -0.18);
+    world.setBasisFromHeadingPitchRoll(-0.74, -0.05, -0.10);
     p.vel.x = p.forward.x * p.speed;
     p.vel.y = p.forward.y * p.speed;
     p.vel.z = p.forward.z * p.speed;
     p.verticalSpeed = p.vel.y;
-    for (let i = 0; i < Math.round(1.4 / STEP); i += 1) {
-      world.step(STEP, { pitch: 0.06, roll: -0.10, yaw: 0, throttleDelta: 0, brake: false }, false);
+    for (let i = 0; i < Math.round(1.2 / STEP); i += 1) {
+      world.step(STEP, { pitch: 0.03, roll: -0.04, yaw: 0, throttleDelta: 0, brake: false }, false);
     }
-    st.toastText = 'West Crags & Wetland Cleared — En route to Mirror Lake';
+    st.toastText = 'Alpine Ridge Cleared — Descending to Glacier Tarn';
     st.toastTimer = 2.6;
     return { screen: SCREEN_PLAY, best: st.ringScore };
   }
 
   if (name === 'approach') {
-    // Low pass beside the waterfall / northern lake outlet at golden hour in approach-phase HUD
+    // Side-front low-altitude pass beside Mirror Lake Falls: lake + snow peaks + falls + offset plane
     st.camMode = 0;
     st.ringsPassed = MISSION_RINGS.length;
     st.ringScore = 5850;
@@ -72,16 +72,20 @@ export function stageShot(name, world) {
     st.goodRings = 2;
     st.missionTime = 332.4;
     p.fuel = 31;
-    p.pos.x = 74;
-    p.pos.y = 28;
-    p.pos.z = -1010;
+    p.pos.x = 89.5;
+    p.pos.y = 37.5;
+    p.pos.z = -1064;
     p.speed = 34; // ~66 kts approach speed
     p.throttle = 0.36;
-    world.setBasisFromHeadingPitchRoll(0.32, -0.07, -0.15);
+    world.setBasisFromHeadingPitchRoll(2.68, -0.06, -0.22);
     p.vel.x = p.forward.x * p.speed;
     p.vel.y = -1.7;
     p.vel.z = p.forward.z * p.speed;
     p.verticalSpeed = -1.7;
+    st.shotCam = {
+      pos: { x: 68, y: 46, z: -1042 },
+      target: { x: 196, y: -38, z: -1305 },
+    };
     st.toastText = 'All 8 Rings Cleared! Pass Mirror Lake Falls for RWY 36';
     st.toastTimer = 3.2;
     return { screen: SCREEN_PLAY, best: 5850 };
@@ -125,26 +129,53 @@ export function stageShot(name, world) {
     return { screen: SCREEN_OVER, best: 8330 };
   }
 
-  // Default: 'start' hero cover shot — cockpit view INSIDE the canyon facing Ring 6 + sunset
+  if (name === 'yoke') {
+    // Extra cockpit verification shot: hard left bank & aft elevator pull with unmistakable yoke rotation + travel
+    st.camMode = 2;
+    st.ringsPassed = 2;
+    st.ringScore = 950;
+    st.ringCombo = 2;
+    st.maxCombo = 2;
+    st.comboMult = 1;
+    st.missionTime = 112.4;
+    p.fuel = 76;
+    p.pos.x = -1480;
+    p.pos.y = 510;
+    p.pos.z = -960;
+    p.speed = 44;
+    p.throttle = 0.72;
+    world.setBasisFromHeadingPitchRoll(-0.78, 0.08, -0.46);
+    p.vel.x = p.forward.x * p.speed;
+    p.vel.y = p.forward.y * p.speed;
+    p.vel.z = p.forward.z * p.speed;
+    p.verticalSpeed = p.vel.y;
+    st.lastControls = { pitch: 0.85, roll: -0.96, yaw: -0.22 };
+    st.elapsed = 1.6;
+    st.toastText = 'Cockpit Hard Left Bank — Smooth Yoke Deflection Check';
+    st.toastTimer = 2.5;
+    return { screen: SCREEN_PLAY, best: 8330 };
+  }
+
+  // Default: 'start' hero cover shot — cockpit view INSIDE the new Eagle Gorge landmark facing Ring 6 + plateau rim + snow peaks
   st.camMode = 2;
-  st.ringsPassed = 6;
-  st.ringScore = 3600;
-  st.ringCombo = 6;
-  st.maxCombo = 6;
+  st.ringsPassed = 5;
+  st.ringScore = 3000;
+  st.ringCombo = 5;
+  st.maxCombo = 5;
   st.comboMult = 3;
-  st.missionTime = 248.5;
-  p.fuel = 58;
-  p.pos.x = 468;
-  p.pos.y = -36;
-  p.pos.z = 340;
+  st.missionTime = 212.5;
+  p.fuel = 62;
+  p.pos.x = 2152;
+  p.pos.y = 128;
+  p.pos.z = 515;
   p.speed = 46;
   p.throttle = 0.68;
-  world.setBasisFromHeadingPitchRoll(-0.11, -0.06, 0.06);
+  world.setBasisFromHeadingPitchRoll(0.47, -0.01, 0.06);
   p.vel.x = p.forward.x * p.speed;
   p.vel.y = p.forward.y * p.speed;
   p.vel.z = p.forward.z * p.speed;
   p.verticalSpeed = p.vel.y;
-  st.lastControls = { pitch: -0.08, roll: 0.14, yaw: 0 };
+  st.lastControls = { pitch: -0.06, roll: 0.14, yaw: 0 };
   st.elapsed = 1.2;
   return { screen: SCREEN_TITLE, best: 8330 };
 }

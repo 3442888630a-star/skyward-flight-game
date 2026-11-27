@@ -32,6 +32,7 @@ const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
+const shotTimeParam = Number.parseFloat(params.get('t') ?? '');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 const seed = Number.isInteger(seedParam) ? seedParam : 1;
 
@@ -62,6 +63,9 @@ function saveBest(value) {
 
 function runShot(name) {
   const scene = stageShot(name, world);
+  if (Number.isFinite(shotTimeParam)) {
+    world.state.elapsed = shotTimeParam;
+  }
   let painted = 0;
   function paint() {
     renderer3D.render(world.state, scene.screen === SCREEN_TITLE, painted === 0);
